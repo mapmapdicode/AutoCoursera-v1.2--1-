@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Extension Popup</title>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            width: 320px;
+            /* Height can be auto to fit content */
+            background-color: #f8fafc;
+            color: #1e293b;
+            margin: 0;
+        }
+
+        .container {
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            /* Adjusted gap */
+        }
+
+        /* Header Styles */
+        header {
+            text-align: center;
+        }
+
+        header h1 {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #0f172a;
+            margin: 0;
+        }
+
+        header p {
+            font-size: 0.875rem;
+            color: #64748b;
+            margin-top: 4px;
+        }
+
+        /* Main content area */
+        .main-content {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            padding-top: 8px;
+        }
+
+        /* Bypass Button Styles */
+        .button {
+            width: 100%;
+            background-color: #dc2626;
+            color: white;
+            font-weight: 600;
+            padding: 12px 16px;
+            border-radius: 8px;
+            border: none;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+            cursor: pointer;
+            transition: all 0.2s ease-in-out;
+        }
+
+        #bypassButton:hover {
+            background-color: #b91c1c;
+            transform: translateY(-2px);
+        }
+
+        #bypassButton:active {
+            transform: translateY(0);
+        }
+
+        .button-subtitle {
+            font-size: 0.75rem;
+            text-align: center;
+            color: #94a3b8;
+            margin-top: 8px;
+        }
+
+        /* Separator */
+        .separator {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            color: #94a3b8;
+            font-size: 0.75rem;
+            font-weight: 500;
+            margin-top: 8px;
+            margin-bottom: 8px;
+        }
+
+        .separator::before,
+        .separator::after {
+            content: '';
+            flex-grow: 1;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        /* Toggle Switch Section */
+        .setting-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background-color: white;
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+        }
+
+        .setting-item-text .title {
+            font-weight: 600;
+            color: #1e293b;
+        }
+
+        .setting-item-text .status {
+            font-size: 0.875rem;
+            color: #64748b;
+        }
+
+        .status.enabled {
+            color: #dc2626;
+            font-weight: 500;
+        }
+
+        /* Toggle Switch Styles */
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 52px;
+            height: 28px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #cbd5e1;
+            transition: .4s;
+            border-radius: 28px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked+.slider {
+            background-color: #dc2626;
+        }
+
+        input:checked+.slider:before {
+            transform: translateX(24px);
+        }
+
+        /* API Key Section */
+        .api-key-section {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            background-color: white;
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+        }
+
+        .api-key-section .title-label {
+            font-weight: 600;
+            color: #1e293b;
+            margin: 0;
+        }
+
+        .input-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        #key,
+        #quiz-result-settle-seconds {
+            padding: 8px 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.875rem;
+            background-color: #f8fafc;
+        }
+
+        #model-select {
+            padding: 8px 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.875rem;
+            background-color: #f8fafc;
+        }
+
+        #key:focus,
+        #model-select:focus,
+        #quiz-result-settle-seconds:focus {
+            outline: none;
+            border-color: #dc2626;
+            box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.2);
+        }
+
+        #save {
+            background-color: #374151;
+            color: white;
+            font-weight: 500;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+
+        #save:hover {
+            background-color: #1f2937;
+        }
+
+        #save.saved {
+            background-color: #16a34a;
+        }
+
+        .secondary-button {
+            background-color: #e2e8f0;
+            color: #1e293b;
+            font-weight: 500;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+
+        .secondary-button:hover {
+            background-color: #cbd5e1;
+        }
+
+        .api-key-subtitle {
+            font-size: 0.75rem;
+            color: #94a3b8;
+            margin: 0;
+        }
+
+        .run-status {
+            font-size: 0.75rem;
+            color: #64748b;
+            text-align: center;
+            margin: 8px 0 0;
+            min-height: 18px;
+        }
+
+        .log-panel {
+            background-color: #0f172a;
+            color: #e2e8f0;
+            border-radius: 8px;
+            padding: 12px;
+            max-height: 220px;
+            overflow-y: auto;
+            font-size: 0.75rem;
+            line-height: 1.45;
+            border: 1px solid #1e293b;
+        }
+
+        .log-panel.empty {
+            color: #94a3b8;
+        }
+
+        .log-line + .log-line {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(148, 163, 184, 0.18);
+        }
+
+        .log-line.error {
+            color: #fca5a5;
+        }
+
+        .log-line.warn {
+            color: #fde68a;
+        }
+
+        .log-time {
+            color: #94a3b8;
+            display: block;
+            margin-bottom: 2px;
+        }
+
+        /* Footer */
+        footer {
+            text-align: center;
+            padding-top: 8px;
+            font-size: 0.75rem;
+            color: #94a3b8;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+
+        <header>
+            <h1>NEW Auto Coursera 1.2</h1>
+            <p>Your smart coursera assistant</p>
+        </header>
+
+        <div class="main-content">
+
+            <div>
+                <button class="button" id="bypass">Complete Course (Partial)</button>
+                <button style="margin-top : 10px;" class="button" id="autoQuiz">Solve quiz</button>
+                <button style="margin-top : 10px;" class="button" id="makeDoneAll">Make Done All</button>
+                <button style="margin-top : 10px;" class="button" id="makeQuizAll">Make Quiz All</button>
+                <p class="run-status" id="run-status"></p>
+            </div>
+
+            <div class="separator">SETTINGS</div>
+
+            <div class="setting-item">
+                <div class="setting-item-text">
+                    <span class="title">Auto Quiz</span>
+                    <span class="text"><br> Require API Key</span>
+                </div>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="quizToggel">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <!-- Gemini API Key Input -->
+            <div class="api-key-section">
+                <label for="key" class="title-label">Gemini Settings</label>
+                <div class="input-container">
+                    <input type="password" id="key" placeholder="Enter API key">
+                    <select id="model-select">
+                        <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+                        <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                        <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                    </select>
+                    <label for="quiz-result-settle-seconds" class="api-key-subtitle">
+                        Wait after confirm submit (seconds)
+                    </label>
+                    <input type="number" id="quiz-result-settle-seconds" min="1" max="120" step="1" value="4">
+                    <button id="save">Save Settings</button>
+                    <button id="export-logs" class="secondary-button">Export Logs</button>
+                </div>
+                <p id="key-status" class="api-key-subtitle">Required for auto-solving quizzes.</p>
+            </div>
+
+            <div class="api-key-section">
+                <label class="title-label" for="run-log">Runner Logs</label>
+                <div id="run-log" class="log-panel empty">No logs yet.</div>
+            </div>
+
+        </div>
+
+        <footer>
+            <p>&copy; 2025 NEW Auto Coursera 1.2</p>
+            <p>Made by ErrorxCode with ❤️</p>
+        </footer>
+
+    </div>
+    <script src="course-runner-helpers.js" defer></script>
+    <script src="popup.js" defer></script>
+</body>
+
+</html>
