@@ -18,7 +18,7 @@
   "background": {
     "service_worker": "background.js"
   },
-"content_scripts": [
+  "content_scripts": [
     {
       "run_at": "document_end",
       "matches": ["*://*.coursera.org/learn*"],
@@ -29,7 +29,12 @@
       "matches": ["*://*.coursera.org/learn*"],
       "js": ["interceptor.js"],
       "world" : "MAIN"
+    },
+    {
+      "run_at": "document_end",
+      "matches": ["*://gemini.google.com/*"],
+      "js": ["gemini-bridge.js"]
     }
   ],
-  "host_permissions": ["*://*.coursera.org/*", "https://generativelanguage.googleapis.com/*", "https://llm.vcoderlog.com/*", "https://api.apiz.vn/*", "https://api.openai.com/*", "https://api.groq.com/*"]
+  "host_permissions": ["*://*.coursera.org/*", "*://gemini.google.com/*", "https://generativelanguage.googleapis.com/*", "https://llm.vcoderlog.com/*", "https://api.apiz.vn/*", "https://api.openai.com/*", "https://api.groq.com/*"]
 }

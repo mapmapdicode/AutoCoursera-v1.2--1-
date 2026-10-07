@@ -589,6 +589,9 @@
             gradeText: newAttempt.gradeText || (typeof newAttempt.scorePercent === "number" ? `${newAttempt.scorePercent}%` : ""),
             passingThreshold: typeof newAttempt.passingThreshold === "number" ? newAttempt.passingThreshold : DEFAULT_PASSING_PERCENT,
             finalState: newAttempt.finalState || "failed",
+            rawFeedback: newAttempt.rawFeedback || "",
+            assignmentContext: newAttempt.assignmentContext || "",
+            itemPath: newAttempt.itemPath || "",
             questions: Array.isArray(newAttempt.questions) ? newAttempt.questions : [],
         };
 
@@ -618,6 +621,18 @@
             passingThreshold: thresholdStr,
             result: isPassed ? "PASSED" : "FAILED (BELOW PASSING THRESHOLD)",
             status: isPassed ? "passed" : "failed",
+            rawFeedback: lastAttempt.rawFeedback || "",
+            assignmentContext: lastAttempt.assignmentContext || "",
+            itemPath: currentItem.path || lastAttempt.itemPath || "",
+            attemptHistory: attempts.map((attempt) => ({
+                attemptNumber: attempt.attemptNumber,
+                scorePercent: attempt.scorePercent,
+                passingThreshold: attempt.passingThreshold,
+                finalState: attempt.finalState,
+                rawFeedback: attempt.rawFeedback || "",
+                assignmentContext: attempt.assignmentContext || "",
+                questions: attempt.questions || [],
+            })),
             summaryInstruction: isPassed
                 ? "The previous attempt PASSED. If retrying to improve score, review confirmed correct answers."
                 : `The previous attempt scored ${scoreStr}, which FAILED to meet the passing threshold of ${thresholdStr}. DO NOT repeat answers that were marked INCORRECT (0 points) or combinations that failed. Retain answers marked CORRECT (full credit), and switch to better alternative options for questions that scored 0 points.`,
@@ -626,6 +641,7 @@
                 prompt: q.prompt || "",
                 type: q.type || "single_choice",
                 submittedOptions: q.chosenOptions || [],
+                allOptions: q.allOptions || [],
                 resultStatus: q.status || "unpassed",
                 points: q.pointsEarned !== undefined && q.pointsTotal !== undefined
                     ? `${q.pointsEarned}/${q.pointsTotal}`
@@ -728,7 +744,7 @@
         } else if (newReview.status === "incorrect") {
             if (Array.isArray(newReview.chosenOptions) && newReview.chosenOptions.length > 0) {
                 // Purge any chosen options from confirmedCorrectOptions to prevent stale/corrupt pre-filling
-                if (Array.isArray(memory.confirmedCorrectOptions)) {
+                if (memory.type !== "multi_select" && Array.isArray(memory.confirmedCorrectOptions)) {
                     memory.confirmedCorrectOptions = memory.confirmedCorrectOptions.filter(
                         (c) => !newReview.chosenOptions.some((chosen) => isOptionMatching(c, chosen))
                     );
@@ -752,7 +768,7 @@
                 // For single_choice questions, any chosen option that yielded 0 points is definitely wrong!
                 const isSingleChoice = memory.type === "single_choice" || memory.type === "mcq" ||
                     newReview.type === "single_choice" ||
-                    (!newReview.hasCheckbox && Array.isArray(newReview.chosenOptions) && newReview.chosenOptions.length === 1);
+                    (memory.type !== "multi_select" && !newReview.hasCheckbox && Array.isArray(newReview.chosenOptions) && newReview.chosenOptions.length === 1);
 
                 if (isSingleChoice) {
                     newReview.chosenOptions.forEach((opt) => {
@@ -792,6 +808,18 @@
             memory.revealedAnswer = "";
         }
 
+        if (Array.isArray(newReview.confirmedCorrectOptions)) {
+            const confirmed = [...(memory.confirmedCorrectOptions || [])];
+            newReview.confirmedCorrectOptions.forEach((option) => {
+                if (!confirmed.some((c) => isOptionMatching(c, option))) confirmed.push(option);
+            });
+            memory.confirmedCorrectOptions = confirmed;
+            memory.knownWrongOptions = (memory.knownWrongOptions || []).filter((wrong) =>
+                !newReview.confirmedCorrectOptions.some((correct) => isOptionMatching(correct, wrong)));
+        }
+        if (memory.type === "multi_select") {
+            memory.confirmedCompleteSet = newReview.status === "correct";
+        }
         return memory;
     }
 
@@ -1081,6 +1109,7 @@
             quiz_solver_fill_ready: `AI đã fill đáp án (${details.answeredCount || 0} đáp án)`,
             quiz_dom_questions_found: `Tìm thấy ${details.count || 0} câu hỏi trên trang`,
             quiz_ai_request_start: `Đang gửi ${details.questionCount || 0} câu hỏi tới AI (APIZ)...`,
+            quiz_gemini_web_start: `Đang gửi ${details.questionCount || 0} câu hỏi sang tab Gemini Web...`,
             quiz_ai_answers_received: `AI đã trả về ${details.answerCount || 0} đáp án`,
             quiz_dom_answers_filled: `Đã tự động điền ${details.filledCount || 0}/${details.totalQuestions || 0} câu hỏi`,
             quiz_dom_no_questions: "Không tìm thấy câu hỏi trong DOM",
@@ -1300,7 +1329,76 @@
         return false;
     }
 
+    function classifyOptionFeedback(text, selected) {
+        const value = String(text || "");
+        if (/should not be selected|incorrect option/i.test(value)) return "incorrect";
+        if (/should be selected|correct answer\s*:/i.test(value)) return "correct";
+        if (/nice work|that's correct|that’s correct/i.test(value)) return selected ? "correct" : "incorrect";
+        if (/try again|not quite/i.test(value)) return selected ? "incorrect" : "correct";
+        return "unknown";
+    }
+
+    async function sendFullFeedback({ text, send }) {
+        if (!text || !String(text).trim()) throw new Error("Feedback page is empty.");
+        const parts = [];
+        for (let offset = 0; offset < text.length; offset += 4000) parts.push(text.slice(offset, offset + 4000));
+        const notes = [];
+        for (let index = 0; index < parts.length; index++) {
+            notes.push(await send(parts[index], index, parts.length));
+        }
+        return notes;
+    }
+
+    function copyRenderedQuestionText(container, doc = document, win = window) {
+        if (!container) return "";
+        const selection = win.getSelection();
+        if (!selection) return "";
+        const previous = Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange());
+        try {
+            const range = doc.createRange();
+            range.selectNodeContents(container);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            return selection.toString().trim();
+        } finally {
+            selection.removeAllRanges();
+            previous.forEach((range) => selection.addRange(range));
+        }
+    }
+
+    async function solveQuizTextFirst({ prompt, solve, capture, onFallback = () => {} }) {
+        const validate = (answers) => {
+            if (!Array.isArray(answers) || !answers.length) throw new Error("AI returned no answers.");
+            return answers;
+        };
+        try {
+            return validate(await solve(prompt, {}));
+        } catch (error) {
+            onFallback(error);
+            const captured = await capture();
+            const screenshotUrls = Array.isArray(captured) ? captured.filter(Boolean) : (captured ? [captured] : []);
+            if (!screenshotUrls.length) throw error;
+            return validate(await solve(prompt, { screenshotUrl: screenshotUrls[0], screenshotUrls }));
+        }
+    }
+
+    function resolveAssignmentTransition({ readyState, text = "", elapsedMs = 0, stableForMs = 0 } = {}) {
+        if (elapsedMs >= 8000 && readyState === "complete" && String(text).trim() && stableForMs >= 3000) return "ready";
+        return elapsedMs >= 45000 ? "timeout" : "wait";
+    }
+
+    function resolveQuizPageLoadState({ readyState, text = "", elapsedMs = 0, timeoutMs = 30000 } = {}) {
+        if (readyState !== "loading" && String(text).trim()) return "ready";
+        return elapsedMs >= timeoutMs ? "timeout" : "wait";
+    }
+
     const api = {
+        classifyOptionFeedback,
+        sendFullFeedback,
+        resolveAssignmentTransition,
+        copyRenderedQuestionText,
+        solveQuizTextFirst,
+        resolveQuizPageLoadState,
         DEFAULT_PASSING_PERCENT,
         buildCourseMaterialsUrl,
         buildPreviousAttemptReport,

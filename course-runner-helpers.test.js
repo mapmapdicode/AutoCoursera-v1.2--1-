@@ -1,6 +1,148 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+test("zero-point multi-select retains individually confirmed correct choices", () => {
+  const h = require("./course-runner-helpers.js");
+  const memory = h.mergeQuestionMemory(null, { prompt: "Impact factors", type: "multi_select", hasCheckbox: true,
+    status: "incorrect", chosenOptions: ["Cost", "Stakeholders", "Threats"],
+    confirmedCorrectOptions: ["Cost", "Stakeholders"], specificWrongOptions: ["Threats"] });
+  assert.deepEqual(memory.confirmedCorrectOptions, ["Cost", "Stakeholders"]);
+  assert.deepEqual(memory.knownWrongOptions, ["Threats"]);
+  assert.equal(memory.wrongAttempts.length, 1);
+  const again = h.mergeQuestionMemory(memory, { prompt: "Impact factors", type: "multi_select", hasCheckbox: true,
+    status: "incorrect", chosenOptions: ["Cost", "Stakeholders"] });
+  assert.deepEqual(again.confirmedCorrectOptions, ["Cost", "Stakeholders"]);
+});
+
+test("option feedback interprets selection state rather than the total question score", () => {
+  const { classifyOptionFeedback } = require("./course-runner-helpers.js");
+  assert.equal(classifyOptionFeedback("Nice work. That's correct.", true), "correct");
+  assert.equal(classifyOptionFeedback("Try again. Not quite.", true), "incorrect");
+  assert.equal(classifyOptionFeedback("Try again. Not quite.", false), "correct");
+  assert.equal(classifyOptionFeedback("Nice work. That's correct.", false), "incorrect");
+  assert.equal(classifyOptionFeedback("This should not be selected", true), "incorrect");
+});
+
+test("full review text is sent in order without losing any content", async () => {
+  const { sendFullFeedback } = require("./course-runner-helpers.js");
+  const text = "Question, chosen answer, incorrect explanation.\n".repeat(250);
+  const parts = [];
+  await sendFullFeedback({ text, send: async (part, index, total) => {
+    assert.equal(index, parts.length);
+    assert.ok(total > 1);
+    assert.ok(part.length <= 4000);
+    parts.push(part);
+    return "Acknowledged";
+  } });
+  assert.equal(parts.join(""), text);
+});
+
+test("feedback transmission failure prevents completion of the feedback step", async () => {
+  const { sendFullFeedback } = require("./course-runner-helpers.js");
+  let sent = 0;
+  await assert.rejects(sendFullFeedback({ text: "x".repeat(10000), send: async () => {
+    if (++sent === 2) throw new Error("Gemini unavailable");
+    return "OK";
+  } }), /Gemini unavailable/);
+  assert.equal(sent, 2);
+});
+
+test("resume transition waits for minimum delay and stable fully loaded content", () => {
+  const { resolveAssignmentTransition } = require("./course-runner-helpers.js");
+  const state = { elapsedMs: 9000, stableForMs: 3500, readyState: "complete", text: "Questions loaded" };
+  assert.equal(resolveAssignmentTransition({ ...state, elapsedMs: 1000 }), "wait");
+  assert.equal(resolveAssignmentTransition({ ...state, readyState: "interactive" }), "wait");
+  assert.equal(resolveAssignmentTransition({ ...state, stableForMs: 1000 }), "wait");
+  assert.equal(resolveAssignmentTransition({ ...state, text: "" }), "wait");
+  assert.equal(resolveAssignmentTransition(state), "ready");
+  assert.equal(resolveAssignmentTransition({ ...state, text: "", elapsedMs: 45000 }), "timeout");
+});
+
+test("copy question text reads the highlighted selection and restores the prior selection", () => {
+  const { copyRenderedQuestionText } = require("./course-runner-helpers.js");
+  const oldRange = { cloneRange() { return this; } };
+  const selection = { rangeCount: 1, getRangeAt: () => oldRange,
+    removeAllRanges() { this.current = null; }, addRange(range) { this.current = range; },
+    toString: () => "Visible question\nA. First\nB. Second" };
+  const container = { textContent: "Hidden JSON must not be copied" };
+  const doc = { createRange: () => ({ selectNodeContents(node) { assert.equal(node, container); } }) };
+  assert.equal(copyRenderedQuestionText(container, doc, { getSelection: () => selection }), "Visible question\nA. First\nB. Second");
+  assert.equal(selection.current, oldRange);
+});
+
+test("image fallback sends every captured question section in order", async () => {
+  const { solveQuizTextFirst } = require("./course-runner-helpers.js");
+  await solveQuizTextFirst({ prompt: "Question",
+    solve: async (_prompt, options) => {
+      if (!options.screenshotUrls) throw new Error("Need image");
+      assert.deepEqual(options.screenshotUrls, ["first", "second"]);
+      return [{ content: "Answer" }];
+    }, capture: async () => ["first", "second"],
+  });
+});
+
+test("text-first solver avoids screenshots when text succeeds", async () => {
+  const { solveQuizTextFirst } = require("./course-runner-helpers.js");
+  let captured = false;
+  const result = await solveQuizTextFirst({
+    prompt: "Full question and feedback",
+    solve: async (prompt, options) => {
+      assert.equal(prompt, "Full question and feedback");
+      assert.equal(options.screenshotUrl, undefined);
+      return [{ content: "Answer" }];
+    },
+    capture: async () => { captured = true; return "image"; },
+  });
+  assert.equal(captured, false);
+  assert.equal(result[0].content, "Answer");
+});
+
+test("text-first solver captures only after text fails or returns no answers", async () => {
+  const { solveQuizTextFirst } = require("./course-runner-helpers.js");
+  for (const empty of [false, true]) {
+    const calls = [];
+    const result = await solveQuizTextFirst({ prompt: "Question",
+      solve: async (_prompt, options) => {
+        calls.push(options.screenshotUrl ? "image" : "text");
+        if (!options.screenshotUrl) {
+          if (empty) return [];
+          throw new Error("Cannot read diagram");
+        }
+        return [{ content: "Visual answer" }];
+      },
+      capture: async () => { calls.push("capture"); return "data:image/png;base64,abc"; },
+    });
+    assert.deepEqual(calls, ["text", "capture", "image"]);
+    assert.equal(result[0].content, "Visual answer");
+  }
+});
+
+test("blank quiz pages wait for loading and time out without being treated as ready", () => {
+  const { resolveQuizPageLoadState } = require("./course-runner-helpers.js");
+  assert.equal(resolveQuizPageLoadState({ readyState: "loading", text: "", elapsedMs: 0 }), "wait");
+  assert.equal(resolveQuizPageLoadState({ readyState: "complete", text: "  ", elapsedMs: 5000 }), "wait");
+  assert.equal(resolveQuizPageLoadState({ readyState: "complete", text: "", elapsedMs: 30000 }), "timeout");
+  assert.equal(resolveQuizPageLoadState({ readyState: "complete", text: "Ready to start the Activity?", elapsedMs: 1000 }), "ready");
+});
+
+test("retry context survives storage round trip with full feedback and earlier attempts", () => {
+  const helpers = require("./course-runner-helpers.js");
+  const feedback = "Detailed rubric feedback. ".repeat(200);
+  let history = helpers.recordQuizAttemptHistory([], {
+    scorePercent: 66.66, passingThreshold: 80, rawFeedback: feedback,
+    assignmentContext: "Original scenario", itemPath: "/learn/course/quiz/item",
+    questions: [{ prompt: "Explain impact", type: "text", allOptions: ["A", "B"], chosenOptions: ["My essay"], feedback: "Missing people impact" }],
+  });
+  history = helpers.recordQuizAttemptHistory(history, { scorePercent: 70, rawFeedback: "Still incomplete" });
+  const report = helpers.buildPreviousAttemptReport(JSON.parse(JSON.stringify(history)), { title: "Impact analysis" });
+  assert.equal(report.attemptHistory[0].rawFeedback, feedback);
+  assert.equal(report.attemptHistory[0].assignmentContext, "Original scenario");
+  assert.deepEqual(report.attemptHistory[0].questions[0].chosenOptions, ["My essay"]);
+  assert.equal(report.rawFeedback, "Still incomplete");
+  const firstReport = helpers.buildPreviousAttemptReport(history.slice(0, 1));
+  assert.deepEqual(firstReport.submittedQuestions[0].allOptions, ["A", "B"]);
+});
+
 const {
   buildCourseMaterialsUrl,
   buildRunnerLogEntry,

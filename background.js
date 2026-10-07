@@ -68,6 +68,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message && message.type === "captureVisibleTab") {
         const windowId = sender.tab ? sender.tab.windowId : undefined;
         try {
+            chrome.tabs.query({ active: true, windowId }, (activeTabs) => {
+                if (chrome.runtime.lastError || !sender.tab || activeTabs[0]?.id !== sender.tab.id) {
+                    sendResponse({ ok: false, error: "Tab Coursera phải đang mở ở phía trước để chụp đúng câu hỏi." });
+                    return;
+                }
             chrome.tabs.captureVisibleTab(
                 windowId,
                 { format: message.format || "jpeg", quality: message.quality || 80 },
@@ -79,6 +84,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     }
                 }
             );
+            });
         } catch (err) {
             sendResponse({ ok: false, error: err.message });
         }
@@ -139,4 +145,176 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         })();
         return true;
     }
+
+    if (message && message.type === "askGeminiWeb") {
+        (async () => {
+            try {
+                const callerTabId = sender.tab ? sender.tab.id : null;
+                const result = await handleAskGeminiWeb(message.prompt, message.options, callerTabId);
+                sendResponse(result);
+            } catch (err) {
+                console.error("[AutoCoursera][Background] askGeminiWeb error:", err);
+                sendResponse({
+                    ok: false,
+                    error: err.message || "Không thể lấy câu trả lời từ tab Gemini Web.",
+                });
+            }
+        })();
+        return true;
+    }
+
+    if (message && message.type === "openGeminiTab") {
+        (async () => {
+            try {
+                const tab = await getOrCreateGeminiTab({ activate: true });
+                sendResponse({ ok: true, tabId: tab.id });
+            } catch (err) {
+                sendResponse({ ok: false, error: err.message });
+            }
+        })();
+        return true;
+    }
 });
+
+function delayMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function waitForTabComplete(tabId, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve(); // timeout fallback
+        }, timeoutMs);
+
+        function listener(updatedTabId, changeInfo) {
+            if (updatedTabId === tabId && changeInfo.status === "complete") {
+                clearTimeout(timer);
+                chrome.tabs.onUpdated.removeListener(listener);
+                resolve();
+            }
+        }
+
+        chrome.tabs.onUpdated.addListener(listener);
+    });
+}
+
+async function getOrCreateGeminiTab(options = {}) {
+    const tabs = await new Promise((resolve) => {
+        chrome.tabs.query({ url: "*://gemini.google.com/*" }, resolve);
+    });
+
+    if (tabs && tabs.length > 0) {
+        const tab = tabs[0];
+        if (options.activate) {
+            chrome.tabs.update(tab.id, { active: true });
+        }
+        return tab;
+    }
+
+    const newTab = await new Promise((resolve) => {
+        chrome.tabs.create(
+            {
+                url: "https://gemini.google.com/app",
+                active: options.activate !== false,
+            },
+            resolve
+        );
+    });
+
+    if (newTab && newTab.id) {
+        await waitForTabComplete(newTab.id, 20000);
+        await delayMs(2500); // Allow Gemini SPA scripts to hydrate
+    }
+
+    return newTab;
+}
+
+async function pingGeminiTab(tabId, maxRetries = 6) {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            const res = await new Promise((resolve, reject) => {
+                chrome.tabs.sendMessage(tabId, { type: "PING_GEMINI" }, (response) => {
+                    if (chrome.runtime.lastError) {
+                        return reject(new Error(chrome.runtime.lastError.message));
+                    }
+                    resolve(response);
+                });
+            });
+
+            if (res && res.isReady) {
+                return res;
+            }
+        } catch (e) {
+            // Wait and retry
+            await delayMs(1000);
+        }
+    }
+    return null;
+}
+
+async function handleAskGeminiWeb(prompt, options = {}, callerTabId = null) {
+    if (!prompt) {
+        throw new Error("Prompt câu hỏi không được để trống.");
+    }
+
+    console.log("[AutoCoursera][Background] Preparing Gemini Web tab for query...");
+    const geminiTab = await getOrCreateGeminiTab({
+        activate: options && options.activateTab === true,
+    });
+
+    if (!geminiTab || !geminiTab.id) {
+        throw new Error("Không thể mở hoặc kết nối tới tab Gemini Web.");
+    }
+
+    const pingStatus = await pingGeminiTab(geminiTab.id, 7);
+    if (!pingStatus) {
+        throw new Error(
+            "Script cầu nối trên tab Gemini chưa sẵn sàng. Hãy đảm bảo tab https://gemini.google.com/app đã được tải xong."
+        );
+    }
+
+    if (pingStatus.loggedIn === false) {
+        // Activate tab so user can log in
+        chrome.tabs.update(geminiTab.id, { active: true });
+        throw new Error(
+            "Chưa đăng nhập Gemini: Vui lòng chuyển sang tab Gemini và đăng nhập tài khoản Google của bạn!"
+        );
+    }
+
+    console.log("[AutoCoursera][Background] Sending prompt to Gemini Web tab id:", geminiTab.id);
+
+    const result = await new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(
+            geminiTab.id,
+            {
+                type: "ASK_GEMINI",
+                prompt,
+                options: {
+                    timeoutMs: (options && options.timeoutMs) || 120000,
+                    screenshotUrls: options.screenshotUrls || [],
+                },
+            },
+            (response) => {
+                if (chrome.runtime.lastError) {
+                    return reject(new Error(chrome.runtime.lastError.message));
+                }
+                if (!response) {
+                    return reject(new Error("Không nhận được phản hồi từ tab Gemini."));
+                }
+                resolve(response);
+            }
+        );
+    });
+
+    // Optionally switch back to Coursera tab so user can see auto-filling
+    if (callerTabId && options && options.activateTab === true) {
+        try {
+            chrome.tabs.update(callerTabId, { active: true });
+        } catch (e) {
+            // Ignore switch back error
+        }
+    }
+
+    return result;
+}

@@ -1,4 +1,5 @@
 const SETTINGS_KEYS = [
+    "aiMode",
     "quiz",
     "key",
     "model",
@@ -32,6 +33,13 @@ document.addEventListener("DOMContentLoaded", () => {
         makeQuizAll: document.getElementById("makeQuizAll"),
         pauseRun: document.getElementById("pauseRun"),
         quizToggle: document.getElementById("quizToggel"),
+        modeGeminiWebRadio: document.getElementById("mode-gemini-web"),
+        modeApiRadio: document.getElementById("mode-api"),
+        labelModeGeminiWeb: document.getElementById("label-mode-gemini-web"),
+        labelModeApi: document.getElementById("label-mode-api"),
+        geminiWebPanel: document.getElementById("gemini-web-panel"),
+        apiKeySection: document.getElementById("api-key-section"),
+        openGeminiTabButton: document.getElementById("open-gemini-tab"),
         apiEndpointInput: document.getElementById("api-endpoint"),
         keyInput: document.getElementById("key"),
         modelSelect: document.getElementById("model-select"),
@@ -79,6 +87,35 @@ async function initializePopup(elements) {
     let selectedModel = getModelValue(settings);
     if (!selectedModel || /^gemini/i.test(selectedModel)) {
         selectedModel = DEFAULT_MODEL;
+    }
+
+    const hasCustomApiKeys = Boolean(
+        (settings.openaiKeys && settings.openaiKeys.length) ||
+        (settings.groqKeys && settings.groqKeys.length) ||
+        settings.key
+    );
+    const initialMode = settings.aiMode || (hasCustomApiKeys ? "api" : "gemini_web");
+    setAiModeUI(elements, initialMode);
+
+    if (elements.modeGeminiWebRadio) {
+        elements.modeGeminiWebRadio.addEventListener("change", () => {
+            setAiModeUI(elements, "gemini_web");
+        });
+    }
+    if (elements.modeApiRadio) {
+        elements.modeApiRadio.addEventListener("change", () => {
+            setAiModeUI(elements, "api");
+        });
+    }
+    if (elements.openGeminiTabButton) {
+        elements.openGeminiTabButton.addEventListener("click", () => {
+            chrome.runtime.sendMessage({ type: "openGeminiTab" }, () => {
+                if (chrome.runtime.lastError) {
+                    chrome.tabs.create({ url: "https://gemini.google.com/app" });
+                }
+                setRunStatus(elements, "Đã mở tab Gemini Web.");
+            });
+        });
     }
 
     elements.keyInput.value = apiKeys.join("\n");
@@ -192,6 +229,9 @@ async function initializePopup(elements) {
     });
 
     elements.saveButton.addEventListener("click", async () => {
+        const aiMode = elements.modeGeminiWebRadio && elements.modeGeminiWebRadio.checked
+            ? "gemini_web"
+            : "api";
         const apiEndpoint = normalizeEndpoint(elements.apiEndpointInput.value);
         elements.apiEndpointInput.value = apiEndpoint;
         const apiKeys = normalizeKeys(elements.keyInput.value);
@@ -214,6 +254,7 @@ async function initializePopup(elements) {
         }
 
         await storageSet({
+            aiMode,
             apiEndpoint,
             openaiKeys: apiKeys,
             openaiModel: selectedModel,
@@ -302,11 +343,51 @@ async function refreshRunLogs(elements, tabId) {
     renderRunLogs(elements, result[storageKey] || []);
 }
 
+function setAiModeUI(elements, mode) {
+    const isGeminiWeb = mode === "gemini_web";
+    if (elements.modeGeminiWebRadio) elements.modeGeminiWebRadio.checked = isGeminiWeb;
+    if (elements.modeApiRadio) elements.modeApiRadio.checked = !isGeminiWeb;
+
+    if (elements.geminiWebPanel) {
+        elements.geminiWebPanel.style.display = isGeminiWeb ? "block" : "none";
+    }
+    if (elements.apiKeySection) {
+        elements.apiKeySection.style.display = isGeminiWeb ? "none" : "block";
+    }
+
+    if (elements.labelModeGeminiWeb) {
+        elements.labelModeGeminiWeb.style.borderColor = isGeminiWeb ? "#22c55e" : "#cbd5e1";
+        elements.labelModeGeminiWeb.style.backgroundColor = isGeminiWeb ? "#f0fdf4" : "#ffffff";
+        const strong = elements.labelModeGeminiWeb.querySelector("strong");
+        if (strong) strong.style.color = isGeminiWeb ? "#15803d" : "#64748b";
+    }
+    if (elements.labelModeApi) {
+        elements.labelModeApi.style.borderColor = !isGeminiWeb ? "#dc2626" : "#cbd5e1";
+        elements.labelModeApi.style.backgroundColor = !isGeminiWeb ? "#fef2f2" : "#ffffff";
+        const strong = elements.labelModeApi.querySelector("strong");
+        if (strong) strong.style.color = !isGeminiWeb ? "#b91c1c" : "#64748b";
+    }
+
+    updateKeyStatus(elements, elements.keyInput ? elements.keyInput.value : []);
+}
+
 function updateKeyStatus(elements, keys) {
-    const apiKeys = normalizeKeys(keys);
-    elements.keyStatus.textContent = apiKeys.length
-        ? `APIZ / ChatGPT keys saved: ${apiKeys.length}. Auto-solving quizzes is available.`
-        : "Required for auto-solving quizzes.";
+    const isGeminiWeb = elements.modeGeminiWebRadio && elements.modeGeminiWebRadio.checked;
+    if (isGeminiWeb) {
+        if (elements.keyStatus) {
+            elements.keyStatus.textContent = "🌟 Đang dùng Gemini Web Tab: Tự động mở tab hỏi đáp án, 100% miễn phí.";
+            elements.keyStatus.style.color = "#16a34a";
+        }
+        return;
+    }
+
+    if (elements.keyStatus) {
+        elements.keyStatus.style.color = "#94a3b8";
+        const apiKeys = normalizeKeys(keys);
+        elements.keyStatus.textContent = apiKeys.length
+            ? `APIZ / ChatGPT keys saved: ${apiKeys.length}. Auto-solving quizzes is available.`
+            : "Required for auto-solving quizzes.";
+    }
 }
 
 function normalizeEndpoint(value) {

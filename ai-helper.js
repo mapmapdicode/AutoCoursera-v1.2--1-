@@ -15,7 +15,67 @@ class GeminiAI {
 
     async generateResponse(prompt, options = {}) {
         const settings = await this.readSettings();
-        const keys = settings.apiKeys;
+        const mode = options.aiMode || settings.aiMode;
+
+        if (mode === "gemini_web") {
+            try {
+                return await this.generateResponseViaGeminiWeb(prompt, options);
+            } catch (webErr) {
+                logAiEvent("gemini_web_error_fallback", { error: webErr.message });
+                if (settings.apiKeys && settings.apiKeys.length > 0 && !settings.apiKeys[0].startsWith("AIzaSy")) {
+                    console.warn("[AutoCoursera][AI] Gemini Web tab failed, falling back to API:", webErr.message);
+                    return await this.generateResponseViaApi(prompt, options, settings);
+                }
+                throw webErr;
+            }
+        }
+
+        return await this.generateResponseViaApi(prompt, options, settings);
+    }
+
+    async generateResponseViaGeminiWeb(prompt, options = {}) {
+        logAiEvent("gemini_web_request_start", { promptLength: prompt.length });
+
+        return new Promise((resolve, reject) => {
+            if (!globalThis.chrome || !chrome.runtime || typeof chrome.runtime.sendMessage !== "function") {
+                return reject(new Error("chrome.runtime.sendMessage không khả dụng để kết nối tab Gemini."));
+            }
+
+            chrome.runtime.sendMessage(
+                {
+                    type: "askGeminiWeb",
+                    prompt,
+                    options: {
+                        timeoutMs: options.timeoutMs || 120000,
+                        activateTab: options.activateTab,
+                        screenshotUrls: options.screenshotUrls || (options.screenshotUrl || options.imageUrl ? [options.screenshotUrl || options.imageUrl] : []),
+                    },
+                },
+                (response) => {
+                    if (chrome.runtime.lastError) {
+                        const errMsg = chrome.runtime.lastError.message || "";
+                        logAiEvent("gemini_web_error", { message: errMsg });
+                        return reject(new Error(`Lỗi kết nối tab Gemini Web: ${errMsg}`));
+                    }
+
+                    if (!response || !response.ok) {
+                        const errMsg = (response && response.error) || "Không nhận được phản hồi từ tab Gemini Web.";
+                        logAiEvent("gemini_web_failed", { error: errMsg });
+                        return reject(new Error(errMsg));
+                    }
+
+                    logAiEvent("gemini_web_response_received", {
+                        responseLength: (response.text || "").length,
+                    });
+                    resolve(response.text);
+                }
+            );
+        });
+    }
+
+    async generateResponseViaApi(prompt, options = {}, settings = null) {
+        const activeSettings = settings || (await this.readSettings());
+        const keys = activeSettings.apiKeys;
 
         if (!keys.length) {
             throw new Error("APIZ / ChatGPT API Key is missing.");
@@ -25,9 +85,9 @@ class GeminiAI {
             throw new Error("Fetch API is not available.");
         }
 
-        const endpoint = options.endpoint || settings.apiEndpoint || this.apiEndpoint || GeminiAI.DEFAULT_API_ENDPOINT;
-        const model = options.model || settings.model || this.model || GeminiAI.DEFAULT_CHATGPT_MODEL;
-        const startIndex = normalizeKeyCursor(settings.keyCursor, keys);
+        const endpoint = options.endpoint || activeSettings.apiEndpoint || this.apiEndpoint || GeminiAI.DEFAULT_API_ENDPOINT;
+        const model = options.model || activeSettings.model || this.model || GeminiAI.DEFAULT_CHATGPT_MODEL;
+        const startIndex = normalizeKeyCursor(activeSettings.keyCursor, keys);
         let lastError = null;
         let rateLimitRetries = 0;
 
@@ -115,7 +175,7 @@ class GeminiAI {
     }
 
     async solveQuestions(questionsPrompt, options = {}) {
-        const hasImage = Boolean(options && (options.screenshotUrl || options.imageUrl));
+        const hasImage = Boolean(options && (options.screenshotUrls?.length || options.screenshotUrl || options.imageUrl));
         const fullPrompt = buildCourseraQuizPrompt(questionsPrompt, hasImage);
         let responseText;
 
@@ -130,6 +190,7 @@ class GeminiAI {
                 const textOnlyOptions = { ...options };
                 delete textOnlyOptions.screenshotUrl;
                 delete textOnlyOptions.imageUrl;
+                delete textOnlyOptions.screenshotUrls;
                 responseText = await this.generateResponse(textOnlyPrompt, textOnlyOptions);
             } else {
                 throw error;
@@ -204,6 +265,7 @@ class GeminiAI {
 
     async readSettings() {
         const storageResult = await storageGet(this.storage, [
+            "aiMode",
             "apiEndpoint",
             "openaiKeys",
             "openaiModel",
@@ -247,7 +309,18 @@ class GeminiAI {
                 ? storageResult.openaiKeyCursor
                 : storageResult.groqKeyCursor;
 
+        const hasCustomApiKeys = Boolean(
+            (storageResult.openaiKeys && storageResult.openaiKeys.length) ||
+            (storageResult.groqKeys && storageResult.groqKeys.length) ||
+            storageResult.key
+        );
+
+        const aiMode = storageResult.aiMode
+            ? storageResult.aiMode
+            : (hasCustomApiKeys ? "api" : "gemini_web");
+
         return {
+            aiMode,
             apiEndpoint,
             apiKeys,
             groqKeys: apiKeys,
@@ -316,16 +389,18 @@ class GeminiAI {
             "  * If the previous attempt scored below passing (e.g. < 80%): Re-evaluate all questions that were not confirmed correct, eliminate failed choices, and switch to better options.",
         ].join("\n");
 
-        const userContent = options.screenshotUrl || options.imageUrl
+        const imageUrls = options.screenshotUrls?.length ? options.screenshotUrls :
+            (options.screenshotUrl || options.imageUrl ? [options.screenshotUrl || options.imageUrl] : []);
+        const userContent = imageUrls.length
             ? [
                 { type: "text", text: prompt },
-                {
+                ...imageUrls.map((url) => ({
                     type: "image_url",
                     image_url: {
-                        url: options.screenshotUrl || options.imageUrl,
+                        url,
                         detail: options.imageDetail || "high",
                     },
-                },
+                })),
             ]
             : prompt;
 

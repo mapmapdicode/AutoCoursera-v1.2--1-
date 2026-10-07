@@ -385,3 +385,108 @@ test("solveQuestions automatically falls back to text-only if image is rejected 
   assert.deepEqual(result[0].correctOptionsIndex, [1]);
 });
 
+test("solveQuestions in gemini_web mode sends askGeminiWeb message and parses response", async () => {
+  const originalChrome = globalThis.chrome;
+  let sentMessage = null;
+
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(msg, callback) {
+        sentMessage = msg;
+        callback({
+          ok: true,
+          text: "```json\n{\"answers\":[{\"correctOptionsIndex\":[2],\"correctOptions\":[\"Answer C\"],\"content\":\"\"}]}\n```",
+        });
+      },
+    },
+  };
+
+  try {
+    const storage = createStorage({
+      aiMode: "gemini_web",
+    });
+
+    const ai = new GeminiAI("", "", {
+      storage: storage.api,
+    });
+
+    const result = await ai.solveQuestions(
+      JSON.stringify({
+        questions: [{ question: "Which is true?", options: ["A", "B", "C"] }],
+        previousAttemptReport: require("./course-runner-helpers.js").buildPreviousAttemptReport(
+          require("./course-runner-helpers.js").recordQuizAttemptHistory([], {
+            scorePercent: 66.66, passingThreshold: 80,
+            rawFeedback: "Rubric: missing impact on people",
+            assignmentContext: "POPIT impact analysis scenario",
+            questions: [{ prompt: "Explain impact", type: "text", chosenOptions: ["Previously submitted essay"] }],
+          })
+        ),
+      })
+    );
+
+    assert.equal(sentMessage.type, "askGeminiWeb");
+    assert.ok(sentMessage.prompt.includes("Rubric: missing impact on people"));
+    assert.ok(sentMessage.prompt.includes("Previously submitted essay"));
+    assert.ok(sentMessage.prompt.includes("POPIT impact analysis scenario"));
+    assert.ok(sentMessage.prompt.includes("66.66%"));
+    assert.ok(sentMessage.prompt.includes("80%"));
+    assert.equal(result.length, 1);
+    assert.deepEqual(result[0].correctOptionsIndex, [2]);
+    assert.deepEqual(result[0].correctOptions, ["Answer C"]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("solveQuestions falls back to API when gemini_web fails and valid API keys are present", async () => {
+  const originalChrome = globalThis.chrome;
+  let webCallAttempted = false;
+  let apiCallAttempted = false;
+
+  globalThis.chrome = {
+    runtime: {
+      sendMessage(msg, callback) {
+        if (msg.type === "askGeminiWeb") {
+          webCallAttempted = true;
+          callback({
+            ok: false,
+            error: "NOT_LOGGED_IN: Chưa đăng nhập Google",
+          });
+        }
+      },
+    },
+  };
+
+  try {
+    const storage = createStorage({
+      aiMode: "gemini_web",
+      openaiKeys: ["sk-fallback-key"],
+    });
+
+    const ai = new GeminiAI("", "", {
+      storage: storage.api,
+      fetch: async () => {
+        apiCallAttempted = true;
+        return createJsonResponse(200, {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  answers: [{ correctOptionsIndex: [0], correctOptions: ["First"], content: "" }],
+                }),
+              },
+            },
+          ],
+        });
+      },
+    });
+
+    const result = await ai.solveQuestions(JSON.stringify([{ question: "Fallback test" }]));
+    assert.ok(webCallAttempted);
+    assert.ok(apiCallAttempted);
+    assert.deepEqual(result[0].correctOptionsIndex, [0]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
