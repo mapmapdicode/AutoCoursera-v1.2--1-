@@ -16,6 +16,70 @@
         return path || "/";
     }
 
+    function getItemSlug(path) {
+        if (!path) return "";
+        const clean = normalizePath(path).replace(/\/(attempt|view-feedback|instructions|feedback|submit|give-feedback|review)$/i, "").replace(/\/+$/, "");
+        const parts = clean.split("/").filter(Boolean);
+        return parts.length ? parts[parts.length - 1] : "";
+    }
+
+    function extractItemId(path) {
+        if (!path) return "";
+        const clean = normalizePath(path);
+        const match = clean.match(/\/learn\/[^/]+\/(?:item|assignment-submission|lecture|quiz|ungradedLti|supplement|peer|exam)\/([A-Za-z0-9_-]+)/i);
+        return match ? match[1] : "";
+    }
+
+    function extractCourseSlug(path) {
+        if (!path) return "";
+        const clean = normalizePath(path);
+        const match = clean.match(/^\/learn\/([^/]+)/i);
+        return match ? match[1].toLowerCase() : "";
+    }
+
+    function matchesItemPath(currentPath, itemPath) {
+        const normalizedCurrent = normalizePath(currentPath);
+        const normalizedItem = normalizePath(itemPath);
+        if (!normalizedCurrent || !normalizedItem) return false;
+        if (
+            normalizedCurrent === normalizedItem ||
+            normalizedCurrent === `${normalizedItem}/attempt` ||
+            normalizedCurrent === `${normalizedItem}/submit` ||
+            normalizedCurrent === `${normalizedItem}/instructions`
+        ) {
+            return true;
+        }
+        const currentClean = normalizedCurrent.replace(/\/(attempt|view-feedback|instructions|feedback|submit|give-feedback|review)$/i, "");
+        const itemClean = normalizedItem.replace(/\/(attempt|view-feedback|instructions|feedback|submit|give-feedback|review)$/i, "");
+        if (currentClean === itemClean) {
+            return true;
+        }
+
+        // Match by identical course slug and item id
+        // (covers /assignment-submission/Fa0r2 vs /assignment-submission/Fa0r2/activity-create-a-basic-diagram)
+        const currentCourse = extractCourseSlug(normalizedCurrent);
+        const itemCourse = extractCourseSlug(normalizedItem);
+        const currentId = extractItemId(normalizedCurrent);
+        const itemId = extractItemId(normalizedItem);
+        if (currentId && itemId) {
+            return Boolean(currentCourse && currentCourse === itemCourse && currentId === itemId);
+        }
+
+        const currentSlug = getItemSlug(normalizedCurrent);
+        const itemSlug = getItemSlug(normalizedItem);
+        if (currentSlug && itemSlug && currentSlug === itemSlug && currentCourse === itemCourse) {
+            return true;
+        }
+        return false;
+    }
+
+    function isPathSkipped(skippedPaths, targetPath) {
+        if (!skippedPaths || !targetPath) return false;
+        if (skippedPaths.has && skippedPaths.has(targetPath)) return true;
+        const list = Array.isArray(skippedPaths) ? skippedPaths : Array.from(skippedPaths || []);
+        return list.some((p) => p === targetPath || matchesItemPath(p, targetPath));
+    }
+
     function normalizeQuizResultSettleSeconds(value, fallback = 4) {
         const parsed = Number(value);
         if (!Number.isFinite(parsed)) {
@@ -43,8 +107,8 @@
         return "lesson";
     }
 
-    function pickFirstIncomplete(items, completionMap) {
-        return items.find((item) => completionMap.get(item.path) !== true) || null;
+    function pickFirstIncomplete(items, completionMap, skippedPaths = new Set()) {
+        return items.find((item) => !isPathSkipped(skippedPaths, item.path) && completionMap.get(item.path) !== true) || null;
     }
 
     function isEligibleQuizItem(item) {
@@ -54,11 +118,11 @@
 
         const value = `${item.path || ""} ${item.title || ""}`.toLowerCase();
 
-        if (/(programming|peer|discussion|lecture|reading|supplement|review)/.test(value)) {
+        if (/(programming|discussion\s+prompt|lecture|reading|supplement)/.test(value)) {
             return false;
         }
 
-        return /(quiz|practice|graded|assignment-submission|attempt)/.test(value);
+        return /(quiz|practice|graded|assignment-submission|attempt|peer|assignment)/.test(value);
     }
 
     function isUngradedAppItem(item) {
@@ -87,7 +151,7 @@
                     return false;
                 }
 
-                if (skippedPaths.has(item.path)) {
+                if (isPathSkipped(skippedPaths, item.path)) {
                     return false;
                 }
 
@@ -96,21 +160,110 @@
         );
     }
 
-    function inferSidebarCompletionSignals({ ariaLabel = "", text = "", hasSuccessIcon = false } = {}) {
-        if (hasSuccessIcon) {
-            return true;
+    const DEFAULT_PASSING_PERCENT = 80;
+
+    function extractGradePercentage(text) {
+        if (!text) return null;
+        const clean = String(text).trim();
+
+        // 1. Percentage formats: "Grade: 80%", "AssignmentGrade: 0%", "Score: 16.66%", "Your grade: 75%", "Highest: 100%"
+        const gradeMatch = clean.match(/(?:grade|score|highest|latest|received|mark)[\s:]*(\d+(?:\.\d+)?)\s*%/i);
+        if (gradeMatch) {
+            const val = parseFloat(gradeMatch[1]);
+            if (!Number.isNaN(val) && val >= 0 && val <= 100) {
+                return val;
+            }
         }
 
-        const value = `${ariaLabel} ${text}`.trim().toLowerCase();
-        if (!value) {
+        // 2. Reverse percentage: "100% grade", "80% score"
+        const reverseMatch = clean.match(/\b(\d+(?:\.\d+)?)\s*%\s*(?:grade|score)/i);
+        if (reverseMatch) {
+            const val = parseFloat(reverseMatch[1]);
+            if (!Number.isNaN(val) && val >= 0 && val <= 100) {
+                return val;
+            }
+        }
+
+        // 3. Fraction format: "Grade: 4/10", "Score: 1/5"
+        const fractionMatch = clean.match(/(?:grade|score|mark)[\s:]*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)/i);
+        if (fractionMatch) {
+            const numerator = parseFloat(fractionMatch[1]);
+            const denominator = parseFloat(fractionMatch[2]);
+            if (!Number.isNaN(numerator) && !Number.isNaN(denominator) && denominator > 0) {
+                const percent = (numerator / denominator) * 100;
+                return Math.min(100, Math.max(0, Math.round(percent * 100) / 100));
+            }
+        }
+
+        // 4. Standalone Grade with 0 or 0%: "Grade: 0"
+        const zeroMatch = clean.match(/\b(?:assignment)?grade[\s:]*0\b/i);
+        if (zeroMatch) {
+            return 0;
+        }
+
+        return null;
+    }
+
+    function extractPassingThreshold(text, defaultThreshold = DEFAULT_PASSING_PERCENT) {
+        if (!text) return defaultThreshold;
+        const match = String(text).match(/(?:passing grade|to pass|pass at|pass with|threshold|minimum passing score)[\s:]*(\d+(?:\.\d+)?)\s*%/i);
+        if (match) {
+            const val = parseFloat(match[1]);
+            if (!Number.isNaN(val) && val > 0 && val <= 100) {
+                return val;
+            }
+        }
+        return defaultThreshold;
+    }
+
+    function inferSidebarCompletionSignals({
+        ariaLabel = "",
+        text = "",
+        hasSuccessIcon = false,
+        passingThreshold = DEFAULT_PASSING_PERCENT,
+    } = {}) {
+        const raw = `${ariaLabel} ${text}`.trim();
+        if (!raw && !hasSuccessIcon) {
             return null;
         }
 
+        const value = raw.toLowerCase();
+
+        // 1. Check if there is an explicit grade percentage
+        const dynamicThreshold = extractPassingThreshold(value, passingThreshold);
+        const gradePercent = extractGradePercentage(raw);
+        if (gradePercent !== null) {
+            // Below passing threshold: Coursera gives 0 credit / unpassed. MUST RETRY.
+            if (gradePercent < dynamicThreshold) {
+                return false;
+            }
+            // Meets or exceeds passing threshold
+            if (gradePercent >= dynamicThreshold) {
+                return true;
+            }
+        }
+
+        // 2. Check for explicit unpassed / failed signals
+        if (/(did not pass|not passed|try again|failed|retake|unsuccessful)/.test(value)) {
+            return false;
+        }
+
+        // 3. Check for unstarted / incomplete signals
         if (/(not submitted|not started|incomplete|pending)/.test(value)) {
             return false;
         }
 
-        if (/(completed|grade:|passed|success)/.test(value)) {
+        // 4. Success icon from Coursera (only present when actually completed/passed)
+        if (hasSuccessIcon) {
+            return true;
+        }
+
+        // 5. Passed / completed signals (without failed / low grade signals)
+        if (/(congratulations|you passed|passed|success)/.test(value)) {
+            return true;
+        }
+
+        if (/\bcompleted\b/.test(value)) {
             return true;
         }
 
@@ -123,7 +276,9 @@
             return false;
         }
 
-        return /^(submit|check|finish|turn in|send answer)/.test(value);
+        const clean = value.replace(/^[^a-zA-Z0-9\u00C0-\u024F\u1EA0-\u1EF9]+/, "").trim();
+        return /^(submit|check|finish|turn in|send answer|nộp bài|nộp)/i.test(clean) ||
+               /\b(submit assignment|submit for review|nộp bài)\b/i.test(clean);
     }
 
     function isContinueActionLabel(label) {
@@ -132,7 +287,9 @@
             return false;
         }
 
-        return /^(continue|next|go to next|next item|continue to next)/.test(value);
+        const clean = value.replace(/^[^a-zA-Z0-9\u00C0-\u024F\u1EA0-\u1EF9]+/, "").trim();
+        return /^(continue|next|go to next|next item|next lesson|next module|continue to next|tiếp tục|mục tiếp theo|tiếp theo)/i.test(clean) ||
+               /(?:^|\b)(next item|go to next|continue to next|tiếp tục|mục tiếp theo|tiếp theo)\b/i.test(clean);
     }
 
     function isStartActionLabel(label) {
@@ -140,24 +297,573 @@
         if (!value) {
             return false;
         }
-
-        return /^(start|begin|open quiz|start quiz)/.test(value);
+        const clean = value.replace(/^[^a-zA-Z0-9\u00C0-\u024F\u1EA0-\u1EF9]+/, "").trim();
+        if (/^(cancel|back|return|review|feedback|help|hủy|quay lại|next item|go to next|next lesson|next module)/i.test(clean)) {
+            return false;
+        }
+        if (/(menu|outline|navigation|search|drawer|sidebar|settings|profile|avatar|notification|dropdown|close|expand|collapse)/i.test(clean)) {
+            return false;
+        }
+        // Standalone "continue" or "next" is for navigation to next lesson, not start quiz
+        if (/^(continue|next)$/i.test(clean)) {
+            return false;
+        }
+        if (/^(start assignment|resume assignment|continue assignment|open assignment|start quiz|resume quiz|continue quiz|take quiz|start practice|take assignment|my submission|start submission)/i.test(clean)) {
+            return true;
+        }
+        if (/^(bắt đầu làm bài|bắt đầu bài tập|làm tiếp bài tập|bắt đầu|làm tiếp|làm bài)/i.test(clean)) {
+            return true;
+        }
+        return /^(start|begin|resume|take\b|retake\b)/i.test(clean);
     }
 
-    function classifyQuizStateText(text) {
+    function isRetryActionLabel(label) {
+        const value = String(label || "").trim().toLowerCase();
+        if (!value) {
+            return false;
+        }
+        const clean = value.replace(/^[^a-zA-Z0-9]+/, "").trim();
+        return /^(retry|try again|retake|take again|retake quiz|start next attempt|start new attempt|start attempt|làm lại|thử lại)/i.test(clean);
+    }
+
+    function isQuizAttemptLocked({
+        pageText = "",
+        retryButton = null,
+        retryButtonDisabled = false,
+        hasRetryButton = false,
+        hasEnabledStartButton = false,
+        hasFailedBanner = false,
+    } = {}) {
+        if (hasEnabledStartButton) {
+            return false;
+        }
+
+        const hasRetry = Boolean(hasRetryButton || retryButton);
+        if (hasRetry && !retryButtonDisabled) {
+            return false;
+        }
+
+        if (hasRetry && retryButtonDisabled) {
+            return true;
+        }
+
+        const text = String(pageText || "").toLowerCase();
+
+        // 1. Text patterns indicating 0 attempts remaining, waiting lockout period, or max attempts reached
+        const hasZeroAttempts =
+            /0\s*of\s*\d+\s*attempts?\s*(every|\/|per|in|\b)/i.test(text) ||
+            /0\s*attempts?\s*(remaining|left)/i.test(text) ||
+            /0\s*(trong|trên)\s*\d+\s*(lần|lượt)/i.test(text) ||
+            /(?:0\s*lượt\s*làm|hết\s*lượt\s*làm)/i.test(text);
+
+        const hasLockoutPeriod =
+            /(?:next attempt available in|try again in|available in \d+\s*(?:hour|minute|day)|quá số lần thử|hết lượt làm bài|thử lại sau \d+\s*giờ)/i.test(text);
+
+        const hasAttemptLimitNotice =
+            /(?:attempt limit reached|maximum attempts reached|you have reached the maximum|vượt quá giới hạn số lần)/i.test(text);
+
+        if (hasZeroAttempts || hasLockoutPeriod || hasAttemptLimitNotice) {
+            return true;
+        }
+
+        return false;
+    }
+
+    function isCancelActionLabel(label) {
+        const value = String(label || "").trim().toLowerCase();
+        if (!value) return false;
+        return /^(cancel|back|return|close|dismiss|hủy|quay lại)/i.test(value);
+    }
+
+    function isUnansweredNoticeText(text) {
+        const value = String(text || "").trim().toLowerCase();
+        if (!value) return false;
+        return /(?:unanswered\s*question|question(?:\s*is|\s*has)?\s*unanswered|please\s*answer\s*all|answer\s*all\s*questions|must\s*select\s*an\s*option|please\s*choose\s*an\s*option|this\s*question\s*requires\s*an\s*answer|this\s*field\s*is\s*required|field\s*is\s*required|invalid\s*response|incomplete\s*submission|you\s*have\s*\d+\s*unanswered|haven't\s*answered\s*all|chưa\s*trả\s*lời|chưa\s*chọn|không\s*được\s*để\s*trống|needs\s*to\s*be\s*a\s*little\s*bit\s*longer|write\s*a\s*few\s*sentences|answer\s*needs\s*to\s*be\s*longer|câu\s*trả\s*lời\s*quá\s*ngắn)/i.test(value);
+    }
+
+    function isPeerAssignmentSubmitted({
+        isPeerItem = false,
+        isSubmitUrl = false,
+        hasSubmissionInputs = false,
+        hasSubmitAction = false,
+        pageText = "",
+        justSubmitted = false,
+    } = {}) {
+        if (!isPeerItem) return false;
+        const hasSubmittedBanner = /(you('ve| have) submitted|your assignment has been submitted|submission received|đã nộp bài|waiting for (your )?grade|waiting for (peer )?reviews|review \d+ peers to get your grade)/i.test(pageText);
+
+        if (justSubmitted) {
+            return hasSubmittedBanner || !hasSubmitAction || !hasSubmissionInputs;
+        }
+
+        if (isSubmitUrl || hasSubmissionInputs || hasSubmitAction) {
+            return false;
+        }
+
+        return hasSubmittedBanner;
+    }
+
+    function isTextQuestionAnswered({
+        isTitle = false,
+        text = "",
+        containerNotice = "",
+        minLength = 50,
+    } = {}) {
+        const clean = String(text || "").trim();
+        if (!clean) return false;
+        if (/^(enter text here|type your response|viết câu trả lời|vui lòng nhập|your response)$/i.test(clean)) {
+            return false;
+        }
+        if (containerNotice && isUnansweredNoticeText(containerNotice)) {
+            return false;
+        }
+        if (isTitle) {
+            return clean.length > 0;
+        }
+        return clean.length >= minLength;
+    }
+
+    function isSubmitConfirmDialogBlocked(dialogText) {
+        const value = String(dialogText || "").trim().toLowerCase();
+        if (!value) return false;
+        return /(?:unanswered|haven't\s*answered|missing\s*answer|incomplete|without\s*answering|not\s*all\s*questions\s*have\s*been\s*answered|chưa\s*trả\s*lời\s*hết)/i.test(value);
+    }
+
+    function checkQuizSubmissionQualityGates({ questions = [], pageErrors = [], dialogText = "" }) {
+        const errors = [...pageErrors];
+        const unansweredIndexes = [];
+
+        if (!Array.isArray(questions) || !questions.length) {
+            return {
+                canSubmit: false,
+                reason: "No quiz questions detected.",
+                unansweredIndexes: [],
+                errors,
+            };
+        }
+
+        questions.forEach((q, idx) => {
+            const isAnswered = q.isAnswered !== undefined
+                ? Boolean(q.isAnswered)
+                : Boolean(
+                    (Array.isArray(q.chosenIndexes) && q.chosenIndexes.length > 0) ||
+                    (Array.isArray(q.chosenOptions) && q.chosenOptions.length > 0 && q.chosenOptions.some((opt) => String(opt || "").trim().length > 0)) ||
+                    (typeof q.content === "string" && q.content.trim().length > 0)
+                );
+
+            if (!isAnswered) {
+                unansweredIndexes.push(idx);
+            }
+        });
+
+        if (unansweredIndexes.length > 0) {
+            return {
+                canSubmit: false,
+                reason: `There are ${unansweredIndexes.length} unanswered questions.`,
+                unansweredIndexes,
+                errors,
+            };
+        }
+
+        if (dialogText && isSubmitConfirmDialogBlocked(dialogText)) {
+            return {
+                canSubmit: false,
+                reason: "Submit confirmation dialog warns about unanswered questions.",
+                unansweredIndexes,
+                errors: [...errors, "Dialog indicates incomplete questions"],
+            };
+        }
+
+        if (errors.length > 0) {
+            return {
+                canSubmit: false,
+                reason: "Validation error notices detected on the page.",
+                unansweredIndexes,
+                errors,
+            };
+        }
+
+        return {
+            canSubmit: true,
+            reason: "All quality gates passed.",
+            unansweredIndexes: [],
+            errors: [],
+        };
+    }
+
+    function normalizeQuestionKey(text) {
+        if (!text) return "";
+        let clean = String(text)
+            .replace(/<[^>]*>/g, " ")
+            .replace(/&nbsp;/gi, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        // Strip leading numbering: "4. ", "Question 4: ", "4) ", "#4 "
+        clean = clean.replace(/^(?:question\s*\d+[\s.:)]*|\d+[\s.:)]+)\s*/i, "");
+
+        // Strip point indicators: "1 point", "1 / 1 point", "(1 point)", "1 pt"
+        clean = clean.replace(/\(?\b\d+(?:\.\d+)?\s*(?:\/\s*\d+(?:\.\d+)?\s*)?(?:points?|pts?)\b\)?/gi, "");
+
+        // Strip surrounding punctuation and lowercase
+        clean = clean
+            .replace(/^[^a-zA-Z0-9\u00C0-\u024F\u1EA0-\u1EF9]+/, "")
+            .replace(/[^a-zA-Z0-9\u00C0-\u024F\u1EA0-\u1EF9?]+$/, "")
+            .trim()
+            .toLowerCase();
+
+        return clean;
+    }
+
+    function normalizeOptionText(text) {
+        if (!text) return "";
+        let clean = String(text)
+            .replace(/<[^>]*>/g, " ")
+            .replace(/&nbsp;/gi, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        // Strip leading choice indicators: "A. ", "a) ", "1. "
+        clean = clean.replace(/^(?:[A-Za-z\d][\s.:)]+)\s*/, "");
+
+        return clean.trim().toLowerCase();
+    }
+
+    function isOptionMatching(candidate, target) {
+        const c = normalizeOptionText(candidate);
+        const t = normalizeOptionText(target);
+        if (!c || !t) return false;
+        if (c === t) return true;
+        if (c.length > 10 && t.length > 10 && (c.includes(t) || t.includes(c))) return true;
+        return false;
+    }
+
+    function extractPointsFromText(text) {
+        const value = String(text || "").trim();
+        if (!value) return null;
+        const match = value.match(/(?:^|\b)(\d+(?:\.\d+)?)\s*(?:\/|\bof\b)\s*(\d+(?:\.\d+)?)\s*(?:points?|pts?|điểm)\b/i);
+        if (match) {
+            return {
+                earned: parseFloat(match[1]),
+                total: parseFloat(match[2]),
+            };
+        }
+        return null;
+    }
+
+    function classifyReviewStatus(text, earned, total) {
+        if (typeof earned === "number" && typeof total === "number" && total > 0) {
+            if (earned >= total) return "correct";
+            if (earned === 0) return "incorrect";
+            return "partially_correct";
+        }
+
+        const value = String(text || "").trim().toLowerCase();
+        if (/\b(correct|100%|full credit)\b/.test(value) && !/\bincorrect\b/.test(value)) {
+            return "correct";
+        }
+        if (/\b(incorrect|0%|no credit|didn't select all|did not select all)\b/.test(value)) {
+            return "incorrect";
+        }
+        return "unknown";
+    }
+
+    function isSameOptionCombination(optionsA, optionsB) {
+        if (!Array.isArray(optionsA) || !Array.isArray(optionsB)) return false;
+        if (optionsA.length !== optionsB.length) return false;
+        const normA = optionsA.map(normalizeOptionText).filter(Boolean).sort();
+        const normB = optionsB.map(normalizeOptionText).filter(Boolean).sort();
+        if (normA.length !== normB.length) return false;
+        return normA.every((val, idx) => val === normB[idx]);
+    }
+
+    function recordQuizAttemptHistory(existingAttempts = [], newAttempt = {}) {
+        const list = Array.isArray(existingAttempts) ? [...existingAttempts] : [];
+        if (!newAttempt || typeof newAttempt !== "object") return list;
+
+        const attemptNumber = list.length + 1;
+        const entry = {
+            attemptNumber,
+            timestamp: newAttempt.timestamp || Date.now(),
+            scorePercent: typeof newAttempt.scorePercent === "number" ? newAttempt.scorePercent : null,
+            gradeText: newAttempt.gradeText || (typeof newAttempt.scorePercent === "number" ? `${newAttempt.scorePercent}%` : ""),
+            passingThreshold: typeof newAttempt.passingThreshold === "number" ? newAttempt.passingThreshold : DEFAULT_PASSING_PERCENT,
+            finalState: newAttempt.finalState || "failed",
+            questions: Array.isArray(newAttempt.questions) ? newAttempt.questions : [],
+        };
+
+        list.push(entry);
+        if (list.length > 10) {
+            list.splice(0, list.length - 10);
+        }
+        return list;
+    }
+
+    function buildPreviousAttemptReport(attempts = [], currentItem = {}) {
+        if (!Array.isArray(attempts) || attempts.length === 0) return null;
+        const lastAttempt = attempts[attempts.length - 1];
+        if (!lastAttempt) return null;
+
+        const scoreStr = lastAttempt.scorePercent !== null && lastAttempt.scorePercent !== undefined
+            ? `${lastAttempt.scorePercent}%`
+            : (lastAttempt.gradeText || "chưa đạt");
+        const thresholdStr = `${lastAttempt.passingThreshold || DEFAULT_PASSING_PERCENT}%`;
+        const isPassed = lastAttempt.finalState === "passed";
+
+        return {
+            attemptNumber: lastAttempt.attemptNumber || attempts.length,
+            totalAttemptsRecorded: attempts.length,
+            previousScore: scoreStr,
+            scorePercent: lastAttempt.scorePercent,
+            passingThreshold: thresholdStr,
+            result: isPassed ? "PASSED" : "FAILED (BELOW PASSING THRESHOLD)",
+            status: isPassed ? "passed" : "failed",
+            summaryInstruction: isPassed
+                ? "The previous attempt PASSED. If retrying to improve score, review confirmed correct answers."
+                : `The previous attempt scored ${scoreStr}, which FAILED to meet the passing threshold of ${thresholdStr}. DO NOT repeat answers that were marked INCORRECT (0 points) or combinations that failed. Retain answers marked CORRECT (full credit), and switch to better alternative options for questions that scored 0 points.`,
+            submittedQuestions: (lastAttempt.questions || []).map((q, idx) => ({
+                questionIndex: idx,
+                prompt: q.prompt || "",
+                type: q.type || "single_choice",
+                submittedOptions: q.chosenOptions || [],
+                resultStatus: q.status || "unpassed",
+                points: q.pointsEarned !== undefined && q.pointsTotal !== undefined
+                    ? `${q.pointsEarned}/${q.pointsTotal}`
+                    : (q.status === "correct" ? "Full credit" : (q.status === "incorrect" ? "0 points" : undefined)),
+                feedback: q.feedback || undefined,
+            })),
+        };
+    }
+
+    function formatQuestionPreviousAttempt(previousQuestion, quizScore = null, passingThreshold = DEFAULT_PASSING_PERCENT) {
+        if (!previousQuestion || !Array.isArray(previousQuestion.chosenOptions) || previousQuestion.chosenOptions.length === 0) {
+            return null;
+        }
+
+        const chosenStr = JSON.stringify(previousQuestion.chosenOptions);
+        const scoreText = quizScore !== null && quizScore !== undefined ? ` (Quiz overall score: ${quizScore}%)` : "";
+        const feedbackText = previousQuestion.feedback && previousQuestion.feedback !== "Incorrect" && previousQuestion.feedback !== "Passed"
+            ? ` COURSERA FEEDBACK / EXPLANATION: "${previousQuestion.feedback}". CRITICAL: Read this explanation carefully, avoid repeating this mistake, and choose the correct answer that aligns with Coursera's explanation.`
+            : "";
+
+        if (previousQuestion.status === "correct") {
+            return `PREVIOUS ATTEMPT${scoreText}: Submitted ${chosenStr} -> STATUS: CORRECT (Full Credit). RETAIN AND SELECT THIS ANSWER.`;
+        }
+
+        if (previousQuestion.status === "incorrect") {
+            return `PREVIOUS ATTEMPT${scoreText}: Submitted ${chosenStr} -> STATUS: INCORRECT (0 points). CRITICAL: DO NOT SELECT ${chosenStr} AGAIN! Choose a different option.${feedbackText}`;
+        }
+
+        return `PREVIOUS ATTEMPT${scoreText}: Submitted ${chosenStr} in a failed quiz attempt (< ${passingThreshold}%). Analyze carefully and consider choosing an alternative option.${feedbackText}`;
+    }
+
+    function mergeQuestionMemory(existingMemory, newReview) {
+        if (!newReview || typeof newReview !== "object" || (!newReview.prompt && !existingMemory)) {
+            return existingMemory || null;
+        }
+
+        const prompt = newReview.prompt || (existingMemory && existingMemory.prompt) || "";
+        const fingerprint = newReview.fingerprint || normalizeQuestionKey(prompt);
+        const memory = existingMemory ? { ...existingMemory } : {
+            prompt,
+            fingerprint,
+            type: newReview.type || "single_choice",
+            confirmedCorrectOptions: [],
+            knownWrongOptions: [],
+            wrongAttempts: [],
+            unpassedAttempts: [],
+            revealedAnswer: "",
+            feedbacks: [],
+            lastFeedback: "",
+            updatedAt: Date.now(),
+        };
+
+        memory.updatedAt = Date.now();
+        if (prompt && !memory.prompt) memory.prompt = prompt;
+        if (newReview.type) memory.type = newReview.type;
+
+        // Track Coursera feedback / hints
+        if (newReview.feedback && newReview.feedback !== "Incorrect" && newReview.feedback !== "Passed") {
+            memory.lastFeedback = newReview.feedback;
+            if (!Array.isArray(memory.feedbacks)) {
+                memory.feedbacks = [];
+            }
+            if (!memory.feedbacks.some((f) => isOptionMatching(f, newReview.feedback))) {
+                memory.feedbacks.push(newReview.feedback);
+            }
+        }
+
+        // If Coursera explicitly revealed the correct answer
+        if (newReview.revealedAnswer) {
+            memory.revealedAnswer = newReview.revealedAnswer;
+            const normRevealed = normalizeOptionText(newReview.revealedAnswer);
+            if (normRevealed && !memory.confirmedCorrectOptions.some((opt) => isOptionMatching(opt, normRevealed))) {
+                memory.confirmedCorrectOptions = [newReview.revealedAnswer];
+            }
+        }
+
+        // Options specifically flagged as wrong by Coursera feedback (e.g. "This should not be selected")
+        if (Array.isArray(newReview.specificWrongOptions) && newReview.specificWrongOptions.length > 0) {
+            const currentWrong = memory.knownWrongOptions || [];
+            newReview.specificWrongOptions.forEach((opt) => {
+                if (!currentWrong.some((w) => isOptionMatching(w, opt))) {
+                    currentWrong.push(opt);
+                }
+            });
+            memory.knownWrongOptions = currentWrong;
+        }
+
+        if (newReview.status === "correct") {
+            if (Array.isArray(newReview.chosenOptions) && newReview.chosenOptions.length > 0) {
+                // Ensure unique options
+                const existing = memory.confirmedCorrectOptions || [];
+                const merged = [...existing];
+                newReview.chosenOptions.forEach((chosen) => {
+                    if (!merged.some((opt) => isOptionMatching(opt, chosen))) {
+                        merged.push(chosen);
+                    }
+                });
+                memory.confirmedCorrectOptions = merged;
+            }
+        } else if (newReview.status === "incorrect") {
+            if (Array.isArray(newReview.chosenOptions) && newReview.chosenOptions.length > 0) {
+                // Purge any chosen options from confirmedCorrectOptions to prevent stale/corrupt pre-filling
+                if (Array.isArray(memory.confirmedCorrectOptions)) {
+                    memory.confirmedCorrectOptions = memory.confirmedCorrectOptions.filter(
+                        (c) => !newReview.chosenOptions.some((chosen) => isOptionMatching(c, chosen))
+                    );
+                }
+
+                const chosenNorm = newReview.chosenOptions.map(normalizeOptionText).sort().join(" || ");
+                const exists = (memory.wrongAttempts || []).some((w) =>
+                    (w.options || []).map(normalizeOptionText).sort().join(" || ") === chosenNorm
+                );
+                if (!exists) {
+                    memory.wrongAttempts = [
+                        ...(memory.wrongAttempts || []),
+                        {
+                            options: newReview.chosenOptions,
+                            timestamp: Date.now(),
+                            feedback: newReview.feedback || "Incorrect",
+                        },
+                    ];
+                }
+
+                // For single_choice questions, any chosen option that yielded 0 points is definitely wrong!
+                const isSingleChoice = memory.type === "single_choice" || memory.type === "mcq" ||
+                    newReview.type === "single_choice" ||
+                    (!newReview.hasCheckbox && Array.isArray(newReview.chosenOptions) && newReview.chosenOptions.length === 1);
+
+                if (isSingleChoice) {
+                    newReview.chosenOptions.forEach((opt) => {
+                        if (!memory.knownWrongOptions.some((w) => isOptionMatching(w, opt))) {
+                            memory.knownWrongOptions.push(opt);
+                        }
+                    });
+                }
+            }
+        } else if (newReview.status === "unpassed_attempt") {
+            // Track unpassed attempt combinations without falsely marking individual options as knownWrong
+            if (Array.isArray(newReview.chosenOptions) && newReview.chosenOptions.length > 0) {
+                const chosenNorm = newReview.chosenOptions.map(normalizeOptionText).sort().join(" || ");
+                const exists = (memory.unpassedAttempts || []).some((w) =>
+                    (w.options || []).map(normalizeOptionText).sort().join(" || ") === chosenNorm
+                );
+                if (!exists) {
+                    memory.unpassedAttempts = [
+                        ...(memory.unpassedAttempts || []),
+                        {
+                            options: newReview.chosenOptions,
+                            timestamp: Date.now(),
+                            feedback: newReview.feedback || "",
+                        },
+                    ];
+                }
+            }
+        }
+
+        // Final sanitization: ensure no knownWrongOption exists in confirmedCorrectOptions or revealedAnswer
+        if (Array.isArray(memory.confirmedCorrectOptions) && Array.isArray(memory.knownWrongOptions) && memory.knownWrongOptions.length > 0) {
+            memory.confirmedCorrectOptions = memory.confirmedCorrectOptions.filter(
+                (c) => !memory.knownWrongOptions.some((w) => isOptionMatching(w, c))
+            );
+        }
+        if (memory.revealedAnswer && Array.isArray(memory.knownWrongOptions) && memory.knownWrongOptions.some((w) => isOptionMatching(w, memory.revealedAnswer))) {
+            memory.revealedAnswer = "";
+        }
+
+        return memory;
+    }
+
+    function formatMemoryForPrompt(memory) {
+        if (!memory) return null;
+        const parts = [];
+
+        if (memory.revealedAnswer) {
+            parts.push(`PROVEN CORRECT ANSWER: "${memory.revealedAnswer}". SELECT THIS ANSWER.`);
+        } else if (Array.isArray(memory.confirmedCorrectOptions) && memory.confirmedCorrectOptions.length > 0) {
+            parts.push(`CONFIRMED CORRECT ANSWER(S) FROM PREVIOUS PASS: ${JSON.stringify(memory.confirmedCorrectOptions)}. SELECT THESE OPTIONS.`);
+        }
+
+        if (Array.isArray(memory.knownWrongOptions) && memory.knownWrongOptions.length > 0) {
+            parts.push(`CRITICAL - DO NOT SELECT THESE CONFIRMED WRONG OPTION(S): ${JSON.stringify(memory.knownWrongOptions)}.`);
+        }
+
+        if (Array.isArray(memory.wrongAttempts) && memory.wrongAttempts.length > 0) {
+            const combinations = memory.wrongAttempts.map((w) => {
+                const optStr = JSON.stringify(w.options);
+                if (w.feedback && w.feedback !== "Incorrect" && w.feedback !== "Passed") {
+                    return `${optStr} (Coursera feedback: "${w.feedback}")`;
+                }
+                return optStr;
+            }).join(", ");
+            parts.push(`FAILED COMBINATION(S) TRIED IN PREVIOUS ATTEMPTS (SCORED 0 POINTS): ${combinations}. DO NOT REPEAT THESE COMBINATIONS.`);
+        }
+
+        if (Array.isArray(memory.unpassedAttempts) && memory.unpassedAttempts.length > 0) {
+            const combinations = memory.unpassedAttempts.map((w) => {
+                const optStr = JSON.stringify(w.options);
+                if (w.feedback && w.feedback !== "Incorrect" && w.feedback !== "Passed") {
+                    return `${optStr} (Coursera feedback: "${w.feedback}")`;
+                }
+                return optStr;
+            }).join(", ");
+            parts.push(`OPTIONS SUBMITTED IN UNPASSED QUIZ ATTEMPTS: ${combinations}. Re-evaluate carefully.`);
+        }
+
+        if (Array.isArray(memory.feedbacks) && memory.feedbacks.length > 0) {
+            const usefulFeedbacks = memory.feedbacks.filter((f) => f && f !== "Incorrect" && f !== "Passed");
+            if (usefulFeedbacks.length > 0) {
+                parts.push(`COURSERA EXPLANATIONS / HINTS FROM PREVIOUS ATTEMPTS: ${JSON.stringify(usefulFeedbacks)}. Use these hints to identify the true correct answer.`);
+            }
+        }
+
+        return parts.length ? parts.join(" ") : null;
+    }
+
+    function classifyQuizStateText(text, passingThreshold = DEFAULT_PASSING_PERCENT) {
         const value = String(text || "").trim().toLowerCase();
         if (!value) {
             return "pending";
         }
 
         if (
-            /(haven't submitted|have not submitted|not submitted yet|not submitted|your grade\s*--|grade\s*--|resume\b|start quiz|begin quiz)/.test(value)
+            /(haven't submitted|have not submitted|not submitted yet|not submitted|your grade\s*--|grade\s*--|resume\b|start quiz|begin quiz|start new attempt|start attempt|start assignment|begin assignment|start to submit|time to submit)/.test(value)
         ) {
             return "pending";
         }
 
+        const gradeResultMatch = value.match(/(?:your grade|grade received|highest score|latest score)[\s:]*(\d+(?:\.\d+)?)\s*%/i);
+        if (gradeResultMatch) {
+            const dynamicThreshold = extractPassingThreshold(value, passingThreshold);
+            const score = parseFloat(gradeResultMatch[1]);
+            if (!Number.isNaN(score)) {
+                return score >= dynamicThreshold ? "passed" : "failed";
+            }
+        }
+
         if (
-            /(congratulations|you passed|passed this|completed this|grade received|you passed this assignment|you passed this quiz)/.test(value)
+            /(congratulations|you passed|passed this|completed this|you passed this assignment|you passed this quiz)/.test(value)
         ) {
             return "passed";
         }
@@ -182,6 +888,7 @@
         hasNextButton,
         startLabel = "",
         pageText = "",
+        passingThreshold = DEFAULT_PASSING_PERCENT,
     }) {
         if (quizState !== "passed" || !hasNextButton) {
             return false;
@@ -194,41 +901,57 @@
 
         const textValue = String(pageText || "").trim().toLowerCase();
         if (
-            /(haven't submitted|have not submitted|not submitted yet|not submitted|your grade\s*--|grade\s*--|resume\b|we keep your highest score)/.test(textValue)
+            /(haven't submitted|have not submitted|not submitted yet|not submitted|your grade\s*--|grade\s*--|resume\b|start assignment|begin assignment)/.test(textValue)
         ) {
             return false;
         }
 
+        if (/(try again|did not pass|failed|not passed)/.test(textValue)) {
+            return false;
+        }
+
+        const dynamicThreshold = extractPassingThreshold(textValue, passingThreshold);
+        const gradeMatch = textValue.match(/\byour grade\b[^\d]{0,40}(\d+(?:\.\d+)?)\s*%/i);
+        if (gradeMatch) {
+            const score = parseFloat(gradeMatch[1]);
+            if (!Number.isNaN(score) && score < dynamicThreshold) {
+                return false;
+            }
+        }
+
         return (
             /(congratulations|you passed this assignment|you passed this quiz|you passed this)/.test(textValue) ||
-            /\byour grade\b[\s\S]{0,80}\b\d{1,3}%/.test(textValue)
+            Boolean(gradeMatch && parseFloat(gradeMatch[1]) >= dynamicThreshold)
         );
     }
 
     function resolveStartActionState({
         hasStartButton,
+        hasStartModalButton = false,
         hasQuizWorkControls = false,
         startClickedAt,
         now,
         transitionTimeoutMs,
     }) {
-        if (hasQuizWorkControls) {
-            return "gone";
+        if (hasStartModalButton) {
+            return "confirm_modal";
         }
 
-        if (!hasStartButton) {
-            return "gone";
+        if (startClickedAt) {
+            if (hasQuizWorkControls || !hasStartButton) {
+                return "gone";
+            }
+            if (now - startClickedAt >= transitionTimeoutMs) {
+                return "timeout";
+            }
+            return "wait";
         }
 
-        if (!startClickedAt) {
+        if (hasStartButton) {
             return "click";
         }
 
-        if (now - startClickedAt >= transitionTimeoutMs) {
-            return "timeout";
-        }
-
-        return "wait";
+        return "gone";
     }
 
     function resolveAttemptRelayState({ controlsReadyAt, now, delayMs }) {
@@ -325,6 +1048,7 @@
                 skip_done: "bỏ qua đã làm",
                 skip_already_skipped: "bỏ qua đã skip trước đó",
                 start_quiz: "bắt đầu quiz",
+                retry_quiz: "làm lại quiz (chưa đạt điểm)",
                 start_app_item: "bắt đầu ungraded app item",
             }[details.decision] || "đang xử lý";
 
@@ -355,15 +1079,50 @@
             quiz_wait_solver_fill: `Chờ AI fill đáp án (${details.answeredCount || 0} đáp án)`,
             quiz_solver_fill_progress: `AI đang fill đáp án (${details.answeredCount || 0} đáp án)`,
             quiz_solver_fill_ready: `AI đã fill đáp án (${details.answeredCount || 0} đáp án)`,
+            quiz_dom_questions_found: `Tìm thấy ${details.count || 0} câu hỏi trên trang`,
+            quiz_ai_request_start: `Đang gửi ${details.questionCount || 0} câu hỏi tới AI (APIZ)...`,
+            quiz_ai_answers_received: `AI đã trả về ${details.answerCount || 0} đáp án`,
+            quiz_dom_answers_filled: `Đã tự động điền ${details.filledCount || 0}/${details.totalQuestions || 0} câu hỏi`,
+            quiz_dom_no_questions: "Không tìm thấy câu hỏi trong DOM",
+            quiz_ai_error: `Lỗi AI: ${details.error || details.message || ""}`.trim(),
+            quiz_ai_failed_max_retries: `AI giải bài thất bại sau ${details.attempts || 3} lần thử. Đã tạm dừng lại để bạn kiểm tra.`,
+            run_paused: "Đã tạm dừng tiến trình tự động.",
+            quiz_ai_text_retry: "Gửi lại câu hỏi sang chế độ văn bản (bỏ qua ảnh)...",
+            quiz_essay_screenshot_captured: `Chụp ảnh màn hình cho câu hỏi tự luận (${details.textQuestionCount || 1} câu)`,
+            quiz_vision_analysis_start: "Chụp ảnh màn hình gửi AI Vision phân tích tình trạng giao diện...",
+            quiz_vision_decision_received: `AI Vision: ${details.action || "none"} -> "${details.targetText || ''}" (${details.reason || ''})`.trim(),
+            quiz_vision_action_clicked: `AI Vision tự động bấm: "${details.targetText || ''}"`,
+            quiz_vision_action_failed: `Không tìm thấy nút "${details.targetText || ''}" trên trang`,
+            quiz_open_view_feedback_to_learn: "Phát hiện điểm chưa đạt, mở View feedback để học lỗi sai & gợi ý từ Coursera",
+            quiz_feedback_inspected: `Đã lưu lại toàn bộ nội dung/gợi ý phản hồi của khung feedback (${details.questionCount || 0} câu)`,
+            quiz_feedback_back_clicked: "Quay lại màn hình tổng kết bài quiz",
+            quiz_attempt_locked: `Bài quiz bị khóa lượt làm (24h/hết lượt thử): ${details.reason || ""}`.trim(),
+            quiz_scroll_range_unlocked: "Đã tự động scroll toàn bộ trang & mở khóa vùng cuộn để đọc đầy đủ nội dung câu hỏi",
+            quiz_assignment_context_found: "Đã trích xuất hướng dẫn/ngữ cảnh bài tập để gửi kèm AI",
             quiz_click_start: "Nhấn Start quiz",
+            quiz_click_modal_continue: 'Bấm "Continue" trên hộp thoại Start new attempt',
             quiz_accept_honor_code: 'Check "I understand and agree"',
             quiz_click_submit: "Submit quiz",
             quiz_confirm_submit: "Confirm submit",
+            quiz_submit_blocked_by_quality_gate: `Chặn submit: chưa điền đủ (${details.unansweredCount || 0} câu) hoặc có cảnh báo lỗi`,
+            quiz_confirm_blocked_unanswered_in_dialog: "Hủy popup submit: Coursera phát hiện còn câu hỏi chưa điền",
+            quiz_quality_gate_passed: `Kiểm tra chất lượng đạt chuẩn: toàn bộ ${details.totalQuestions || 0} câu hỏi đã được điền hợp lệ`,
             wait_quiz_result: `Chờ ${details.seconds || 0}s để nhận kết quả`,
             quiz_result_passed: "Quiz đã pass",
             quiz_result_failed: "Quiz không pass",
             quiz_click_next_item: 'Chọn "Next item" trở về',
             quiz_click_continue: 'Chọn "Continue"',
+            quiz_retry_attempt: `Làm lại quiz lần ${details.attemptNumber || 1}/${(details.maxRetries || 0) + 1} (lần trước: ${details.previousScore || 'chưa đạt'})`,
+            quiz_memory_updated: `Ghi nhớ kết quả quiz (${details.recordedCount || 0} câu, lần ${details.totalAttempts || 1}: ${details.scorePercent !== null && details.scorePercent !== undefined ? details.scorePercent + '%' : (details.finalState || '')})`,
+            quiz_memory_prefilled: `Áp dụng đáp án đúng đã ghi nhớ cho ${details.resolvedCount || 0}/${details.totalQuestions || 0} câu hỏi`,
+            quiz_memory_avoided_wrong: `Tránh đáp án sai đã ghi nhớ cho "${details.question ? details.question.slice(0, 30) + '...' : ''}"`,
+            quiz_memory_avoided_wrong_multi: `Loại bỏ đáp án sai đã ghi nhớ (${details.avoidedWrong || ''})`,
+            quiz_loop_detected_altering_combination: "Phát hiện tổ hợp từng bị 0 điểm, tự động đổi phương án khác để tránh lặp",
+            quiz_previous_attempt_attached: `Đính kèm kết quả lần trước (${details.previousScore || 'chưa đạt'}) và toàn bộ đáp án cũ vào AI`,
+            peer_tab_click_my_submission: "Chuyển sang tab My submission để làm bài nộp",
+            peer_submission_start: `Bắt đầu làm bài tự luận / nộp bài (${title})`,
+            peer_submission_filled: `Đã điền tiêu đề và ${details.filledCount || 0} phần bài làm`,
+            peer_submission_submitted: "Đã nộp bài peer assignment thành công",
             quiz_run_skipped: `${title} => bỏ qua`,
             quiz_run_finished: "Hoàn thành quiz run",
             quiz_run_aborted: `Dừng quiz run: ${details.message || ""}`.trim(),
@@ -517,26 +1276,79 @@
         return bucket;
     }
 
+    function normalizeVisionDecision(decision = {}) {
+        if (!decision || typeof decision !== "object") {
+            return { action: "none", targetText: "", targetSelector: "", reason: "" };
+        }
+        const action = String(decision.action || "none").toLowerCase().trim();
+        const validActions = ["click", "wait", "refresh", "none"];
+        return {
+            action: validActions.includes(action) ? action : "none",
+            targetText: String(decision.targetText || decision.buttonText || "").trim(),
+            targetSelector: String(decision.targetSelector || "").trim(),
+            reason: String(decision.reason || "").trim(),
+        };
+    }
+
+    function isMatchingClickableText(elementText, targetText) {
+        const elem = String(elementText || "").replace(/\s+/g, " ").trim().toLowerCase();
+        const target = String(targetText || "").replace(/\s+/g, " ").trim().toLowerCase();
+        if (!elem || !target) return false;
+        if (elem === target) return true;
+        if (elem.startsWith(target) || elem.endsWith(target)) return true;
+        if (target.length >= 3 && elem.includes(target)) return true;
+        return false;
+    }
+
     const api = {
+        DEFAULT_PASSING_PERCENT,
         buildCourseMaterialsUrl,
+        buildPreviousAttemptReport,
         buildRunnerLogEntry,
         buildRunnerLogMessage,
+        checkQuizSubmissionQualityGates,
         classifyQuizStateText,
+        classifyReviewStatus,
         describeRunnerLogEntry,
+        extractCourseSlug,
+        extractGradePercentage,
+        extractItemId,
+        extractPassingThreshold,
+        extractPointsFromText,
         flattenCourseStructure,
+        formatMemoryForPrompt,
+        formatQuestionPreviousAttempt,
         formatRunnerLogExport,
+        getItemSlug,
         guessItemType,
         inferSidebarCompletionSignals,
+        isCancelActionLabel,
         isContinueActionLabel,
         isEligibleQuizItem,
         isEligibleQuizRunItem,
+        isMatchingClickableText,
+        isOptionMatching,
+        isPathSkipped,
+        isPeerAssignmentSubmitted,
+        isQuizAttemptLocked,
+        isRetryActionLabel,
+        isSameOptionCombination,
         isStartActionLabel,
         isSubmitActionLabel,
+        isSubmitConfirmDialogBlocked,
+        isTextQuestionAnswered,
+        isUnansweredNoticeText,
         isUngradedAppItem,
+        matchesItemPath,
+        mergeQuestionMemory,
+        normalizeOptionText,
+        normalizeQuestionKey,
         normalizeQuizResultSettleSeconds,
         normalizePath,
+        normalizeVisionDecision,
         pickFirstIncomplete,
         pickFirstIncompleteQuiz,
+        recordQuizAttemptHistory,
         resolveAttemptRelayState,
         resolveStartActionState,
         resolveSolverFillState,

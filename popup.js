@@ -1,6 +1,22 @@
-const SETTINGS_KEYS = ["quiz", "key", "model", "quizResultSettleSeconds"];
-const DEFAULT_MODEL = "gemini-2.5-flash";
+const SETTINGS_KEYS = [
+    "quiz",
+    "key",
+    "model",
+    "apiEndpoint",
+    "openaiKeys",
+    "openaiModel",
+    "groqKeys",
+    "groqModel",
+    "quizResultSettleSeconds",
+    "quizMaxRetries",
+    "quizPassingThreshold",
+];
+const DEFAULT_ENDPOINT = "https://llm.vcoderlog.com/";
+const DEFAULT_KEY = "sk-f12dd12cc0944935-5ndjfx-d292546a";
+const DEFAULT_MODEL = "gh/gpt-5.6-luna";
 const DEFAULT_QUIZ_RESULT_SETTLE_SECONDS = 4;
+const DEFAULT_QUIZ_MAX_RETRIES = 2;
+const DEFAULT_QUIZ_PASSING_THRESHOLD = 80;
 const LOG_PREVIEW_LIMIT = 18;
 const {
     describeRunnerLogEntry,
@@ -14,10 +30,16 @@ document.addEventListener("DOMContentLoaded", () => {
         autoQuiz: document.getElementById("autoQuiz"),
         makeDoneAll: document.getElementById("makeDoneAll"),
         makeQuizAll: document.getElementById("makeQuizAll"),
+        pauseRun: document.getElementById("pauseRun"),
         quizToggle: document.getElementById("quizToggel"),
+        apiEndpointInput: document.getElementById("api-endpoint"),
         keyInput: document.getElementById("key"),
         modelSelect: document.getElementById("model-select"),
         quizResultSettleInput: document.getElementById("quiz-result-settle-seconds"),
+        quizMaxRetriesInput: document.getElementById("quiz-max-retries"),
+        quizPassingThresholdInput: document.getElementById("quiz-passing-threshold"),
+        memoryStatus: document.getElementById("memory-status"),
+        clearMemoryButton: document.getElementById("clear-memory"),
         saveButton: document.getElementById("save"),
         exportLogsButton: document.getElementById("export-logs"),
         keyStatus: document.getElementById("key-status"),
@@ -36,11 +58,57 @@ async function initializePopup(elements) {
     const activeTab = await getActiveTab();
 
     elements.quizToggle.checked = Boolean(settings.quiz);
-    elements.keyInput.value = settings.key || "";
-    elements.modelSelect.value = settings.model || DEFAULT_MODEL;
+    let endpoint = settings.apiEndpoint || DEFAULT_ENDPOINT;
+    if (/generativelanguage\.googleapis\.com/i.test(endpoint)) {
+        endpoint = DEFAULT_ENDPOINT;
+    }
+    elements.apiEndpointInput.value = endpoint;
+
+    const rawKeys =
+        (settings.openaiKeys && settings.openaiKeys.length)
+            ? settings.openaiKeys
+            : (settings.groqKeys && settings.groqKeys.length)
+            ? settings.groqKeys
+            : settings.key;
+
+    let apiKeys = normalizeKeys(rawKeys || DEFAULT_KEY);
+    if (!apiKeys.length || apiKeys.every((k) => k.startsWith("AIzaSy"))) {
+        apiKeys = [DEFAULT_KEY];
+    }
+
+    let selectedModel = getModelValue(settings);
+    if (!selectedModel || /^gemini/i.test(selectedModel)) {
+        selectedModel = DEFAULT_MODEL;
+    }
+
+    elements.keyInput.value = apiKeys.join("\n");
+    if (selectedModel && !Array.from(elements.modelSelect.options).some((o) => o.value === selectedModel)) {
+        const opt = document.createElement("option");
+        opt.value = selectedModel;
+        opt.textContent = `${selectedModel} (Active)`;
+        elements.modelSelect.appendChild(opt);
+    }
+    elements.modelSelect.value = selectedModel;
     elements.quizResultSettleInput.value = getQuizResultSettleSeconds(settings.quizResultSettleSeconds);
-    updateKeyStatus(elements, settings.key);
+    elements.quizMaxRetriesInput.value = Number.isFinite(Number(settings.quizMaxRetries))
+        ? Number(settings.quizMaxRetries)
+        : DEFAULT_QUIZ_MAX_RETRIES;
+    if (elements.quizPassingThresholdInput) {
+        elements.quizPassingThresholdInput.value = Number.isFinite(Number(settings.quizPassingThreshold))
+            ? Number(settings.quizPassingThreshold)
+            : DEFAULT_QUIZ_PASSING_THRESHOLD;
+    }
+    updateKeyStatus(elements, apiKeys);
+    await updateMemoryStatus(elements);
     bindStorageListener(elements, activeTab.id);
+
+    if (elements.clearMemoryButton) {
+        elements.clearMemoryButton.addEventListener("click", async () => {
+            await clearAllQuizMemory();
+            await updateMemoryStatus(elements);
+            setRunStatus(elements, "Quiz memory cleared.");
+        });
+    }
 
     elements.bypass.addEventListener("click", async () => {
         await sendMessageToTab(activeTab.id, "bypass");
@@ -91,6 +159,32 @@ async function initializePopup(elements) {
         }
     });
 
+    if (elements.pauseRun) {
+        elements.pauseRun.addEventListener("click", async () => {
+            elements.pauseRun.disabled = true;
+            setRunStatus(elements, "Đang tạm dừng...");
+
+            try {
+                await sendMessageToTab(activeTab.id, { type: "pauseRun" });
+            } catch (ignore) {}
+
+            try {
+                const fullKey = `fullRunState:${activeTab.id}`;
+                const quizKey = `quizRunState:${activeTab.id}`;
+                await storageSet({
+                    [fullKey]: { active: false, status: "paused", lastStatus: "Đã tạm dừng", processing: false, updatedAt: Date.now() },
+                    [quizKey]: { active: false, status: "paused", lastStatus: "Đã tạm dừng", processing: false, updatedAt: Date.now() },
+                });
+                setRunStatus(elements, "Đã tạm dừng tiến trình tự động.");
+            } catch (err) {
+                setRunStatus(elements, "Đã tạm dừng.");
+            } finally {
+                elements.pauseRun.disabled = false;
+                await refreshRunStatus(elements, activeTab.id);
+            }
+        });
+    }
+
     elements.quizToggle.addEventListener("change", async () => {
         const quizEnabled = elements.quizToggle.checked;
         await storageSet({ quiz: quizEnabled });
@@ -98,15 +192,41 @@ async function initializePopup(elements) {
     });
 
     elements.saveButton.addEventListener("click", async () => {
-        const key = elements.keyInput.value.trim();
-        const model = elements.modelSelect.value || DEFAULT_MODEL;
+        const apiEndpoint = normalizeEndpoint(elements.apiEndpointInput.value);
+        elements.apiEndpointInput.value = apiEndpoint;
+        const apiKeys = normalizeKeys(elements.keyInput.value);
+        const selectedModel = elements.modelSelect.value || DEFAULT_MODEL;
         const quizResultSettleSeconds = getQuizResultSettleSeconds(
             elements.quizResultSettleInput.value
         );
         elements.quizResultSettleInput.value = quizResultSettleSeconds;
+        const quizMaxRetries = Math.max(0, Math.min(5, parseInt(elements.quizMaxRetriesInput.value, 10) || 0));
+        elements.quizMaxRetriesInput.value = quizMaxRetries;
+        const quizPassingThreshold = Math.max(
+            1,
+            Math.min(
+                100,
+                parseInt(elements.quizPassingThresholdInput && elements.quizPassingThresholdInput.value, 10) || DEFAULT_QUIZ_PASSING_THRESHOLD
+            )
+        );
+        if (elements.quizPassingThresholdInput) {
+            elements.quizPassingThresholdInput.value = quizPassingThreshold;
+        }
 
-        await storageSet({ key, model, quizResultSettleSeconds });
-        updateKeyStatus(elements, key);
+        await storageSet({
+            apiEndpoint,
+            openaiKeys: apiKeys,
+            openaiModel: selectedModel,
+            // Keep legacy keys populated so other scripts continue to work
+            groqKeys: apiKeys,
+            groqModel: selectedModel,
+            key: apiKeys[0] || "",
+            model: selectedModel,
+            quizResultSettleSeconds,
+            quizMaxRetries,
+            quizPassingThreshold,
+        });
+        updateKeyStatus(elements, apiKeys);
         elements.saveButton.classList.add("saved");
         setRunStatus(elements, "Settings saved.");
 
@@ -182,11 +302,59 @@ async function refreshRunLogs(elements, tabId) {
     renderRunLogs(elements, result[storageKey] || []);
 }
 
-function updateKeyStatus(elements, key) {
-    elements.keyStatus.textContent = key
-        ? "Gemini API key saved. Auto-solving quizzes is available."
+function updateKeyStatus(elements, keys) {
+    const apiKeys = normalizeKeys(keys);
+    elements.keyStatus.textContent = apiKeys.length
+        ? `APIZ / ChatGPT keys saved: ${apiKeys.length}. Auto-solving quizzes is available.`
         : "Required for auto-solving quizzes.";
 }
+
+function normalizeEndpoint(value) {
+    let endpoint = String(value || "").trim();
+    if (!endpoint) {
+        return DEFAULT_ENDPOINT;
+    }
+    if (!/\/chat\/completions\/?$/i.test(endpoint)) {
+        endpoint = endpoint.replace(/\/+$/, "");
+        if (/\/v1$/i.test(endpoint)) {
+            endpoint = `${endpoint}/chat/completions`;
+        } else {
+            endpoint = `${endpoint}/v1/chat/completions`;
+        }
+    }
+    return endpoint;
+}
+
+function getModelValue(settings) {
+    const model = settings.openaiModel || settings.groqModel || settings.model || DEFAULT_MODEL;
+    if (/^qwen|^llama|^deepseek/i.test(model)) {
+        return DEFAULT_MODEL;
+    }
+
+    return model || DEFAULT_MODEL;
+}
+const getGroqModelValue = getModelValue;
+
+function normalizeKeys(value) {
+    const candidates = Array.isArray(value)
+        ? value
+        : String(value || "").split(/\r?\n|,/);
+    const seen = new Set();
+    const keys = [];
+
+    candidates.forEach((item) => {
+        const key = String(item || "").trim();
+        if (!key || seen.has(key)) {
+            return;
+        }
+
+        seen.add(key);
+        keys.push(key);
+    });
+
+    return keys;
+}
+const normalizeGroqKeys = normalizeKeys;
 
 function setRunStatus(elements, message) {
     elements.runStatus.textContent = message || "";
@@ -399,4 +567,36 @@ function formatLogTimestamp(timestamp) {
     return date.toLocaleTimeString("en-GB", {
         hour12: false,
     });
+}
+
+async function updateMemoryStatus(elements) {
+    if (!elements || !elements.memoryStatus) return;
+    const allData = await storageGet(null);
+    let totalQuestions = 0;
+    let totalAttempts = 0;
+    let coursesCount = 0;
+    Object.keys(allData || {}).forEach((key) => {
+        if (key.startsWith("courseraQuizMemory:")) {
+            coursesCount++;
+            const mem = allData[key];
+            if (mem && mem.questions) {
+                totalQuestions += Object.keys(mem.questions).length;
+            }
+            if (mem && mem.quizAttempts) {
+                Object.values(mem.quizAttempts).forEach((list) => {
+                    if (Array.isArray(list)) totalAttempts += list.length;
+                });
+            }
+        }
+    });
+    const attemptsPart = totalAttempts > 0 ? `, ${totalAttempts} lần nộp` : "";
+    elements.memoryStatus.textContent = `${totalQuestions} câu hỏi${attemptsPart} (${coursesCount} môn học)`;
+}
+
+async function clearAllQuizMemory() {
+    const allData = await storageGet(null);
+    const keysToRemove = Object.keys(allData || {}).filter((k) => k.startsWith("courseraQuizMemory:"));
+    if (keysToRemove.length) {
+        await new Promise((resolve) => chrome.storage.local.remove(keysToRemove, resolve));
+    }
 }

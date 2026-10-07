@@ -36,13 +36,14 @@ chrome.tabs.onUpdated.addListener(async function (tabId, changeInfo, tab) {
             sendTabMessage(tabId, "attempt");
         }
 
-        if (fullRunState && fullRunState.active) {
+        if (fullRunState && fullRunState.active && fullRunState.status !== "paused") {
             sendTabMessage(tabId, { type: "resumeMakeDoneAll" });
         }
 
         if (
             quizRunState &&
             quizRunState.active &&
+            quizRunState.status !== "paused" &&
             !quizRunState.processing
         ) {
             sendTabMessage(tabId, { type: "resumeMakeQuizAll" });
@@ -62,6 +63,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message && message.type === "getTabId") {
         sendResponse({ tabId: sender.tab ? sender.tab.id : null });
         return;
+    }
+
+    if (message && message.type === "captureVisibleTab") {
+        const windowId = sender.tab ? sender.tab.windowId : undefined;
+        try {
+            chrome.tabs.captureVisibleTab(
+                windowId,
+                { format: message.format || "jpeg", quality: message.quality || 80 },
+                (dataUrl) => {
+                    if (chrome.runtime.lastError) {
+                        sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+                    } else {
+                        sendResponse({ ok: true, dataUrl });
+                    }
+                }
+            );
+        } catch (err) {
+            sendResponse({ ok: false, error: err.message });
+        }
+        return true;
     }
 
     if (message && message.type === "relayTabMessage") {
@@ -86,5 +107,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } catch (error) {
             sendResponse({ ok: false, error: error.message });
         }
+    }
+
+    if (message && message.type === "fetchAi") {
+        (async () => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 28000);
+            try {
+                const fetchOptions = {
+                    ...message.options,
+                    signal: controller.signal,
+                };
+                const response = await fetch(message.url, fetchOptions);
+                clearTimeout(timer);
+                const body = await response.json().catch(() => ({}));
+                sendResponse({
+                    ok: response.ok,
+                    status: response.status,
+                    statusText: response.statusText,
+                    body: body,
+                });
+            } catch (err) {
+                clearTimeout(timer);
+                const isAbort = err && err.name === "AbortError";
+                sendResponse({
+                    ok: false,
+                    status: isAbort ? 504 : 0,
+                    error: isAbort ? "AI request timed out (28s)." : (err && err.message) || "Fetch failed",
+                });
+            }
+        })();
+        return true;
     }
 });

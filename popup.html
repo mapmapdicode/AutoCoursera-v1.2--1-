@@ -72,6 +72,11 @@
             transform: translateY(0);
         }
 
+        #pauseRun:hover {
+            background-color: #d97706 !important;
+            transform: translateY(-2px);
+        }
+
         .button-subtitle {
             font-size: 0.75rem;
             text-align: center;
@@ -196,6 +201,7 @@
         }
 
         #key,
+        #api-endpoint,
         #quiz-result-settle-seconds {
             padding: 8px 12px;
             border: 1px solid #cbd5e1;
@@ -203,6 +209,11 @@
             font-family: 'Inter', sans-serif;
             font-size: 0.875rem;
             background-color: #f8fafc;
+        }
+
+        #key {
+            min-height: 92px;
+            resize: vertical;
         }
 
         #model-select {
@@ -215,6 +226,7 @@
         }
 
         #key:focus,
+        #api-endpoint:focus,
         #model-select:focus,
         #quiz-result-settle-seconds:focus {
             outline: none;
@@ -332,6 +344,7 @@
                 <button style="margin-top : 10px;" class="button" id="autoQuiz">Solve quiz</button>
                 <button style="margin-top : 10px;" class="button" id="makeDoneAll">Make Done All</button>
                 <button style="margin-top : 10px;" class="button" id="makeQuizAll">Make Quiz All</button>
+                <button style="margin-top : 10px; background-color: #f59e0b;" class="button" id="pauseRun">⏸️ Tạm dừng (Pause / Stop)</button>
                 <p class="run-status" id="run-status"></p>
             </div>
 
@@ -348,24 +361,45 @@
                 </label>
             </div>
 
-            <!-- Gemini API Key Input -->
+            <!-- APIZ / ChatGPT Luna API Key Input -->
             <div class="api-key-section">
-                <label for="key" class="title-label">Gemini Settings</label>
+                <label for="key" class="title-label">AI Settings (Google Gemini / OpenAI)</label>
                 <div class="input-container">
-                    <input type="password" id="key" placeholder="Enter API key">
+                    <label for="api-endpoint" class="api-key-subtitle">API Endpoint</label>
+                    <input type="text" id="api-endpoint" placeholder="https://llm.vcoderlog.com/" value="https://llm.vcoderlog.com/">
+                    <label for="key" class="api-key-subtitle">API Key</label>
+                    <textarea id="key" placeholder="Enter API keys, one per line"></textarea>
+                    <label for="model-select" class="api-key-subtitle">Model</label>
                     <select id="model-select">
-                        <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
-                        <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                        <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                        <option value="gh/gpt-5.6-luna" selected>ChatGPT GPT-5.6 Luna (vcoderlog - Recommended)</option>
+                        <option value="gpt-6-luna">ChatGPT GPT-6 Luna (APIZ)</option>
+                        <option value="gemini-flash-latest">Google Gemini Flash (Latest Free)</option>
+                        <option value="gemini-2.5-flash-lite">Google Gemini 2.5 Flash-Lite</option>
                     </select>
                     <label for="quiz-result-settle-seconds" class="api-key-subtitle">
                         Wait after confirm submit (seconds)
                     </label>
                     <input type="number" id="quiz-result-settle-seconds" min="1" max="120" step="1" value="4">
+                    <label for="quiz-max-retries" class="api-key-subtitle">
+                        Auto-retry if not passed (retries, 0-5)
+                    </label>
+                    <input type="number" id="quiz-max-retries" min="0" max="5" step="1" value="2">
+                    <label for="quiz-passing-threshold" class="api-key-subtitle">
+                        Ngưỡng điểm đạt làm lại (%) (Coursera chuẩn 80%)
+                    </label>
+                    <input type="number" id="quiz-passing-threshold" min="1" max="100" step="1" value="80">
                     <button id="save">Save Settings</button>
                     <button id="export-logs" class="secondary-button">Export Logs</button>
                 </div>
                 <p id="key-status" class="api-key-subtitle">Required for auto-solving quizzes.</p>
+            </div>
+
+            <div class="api-key-section">
+                <label class="title-label">Quiz Memory (Ghi nhớ đáp án đúng / sai)</label>
+                <div class="input-container">
+                    <p id="memory-status" class="api-key-subtitle" style="margin-bottom: 8px;">0 câu hỏi đã ghi nhớ</p>
+                    <button id="clear-memory" class="secondary-button">Clear Quiz Memory (Xóa bộ nhớ)</button>
+                </div>
             </div>
 
             <div class="api-key-section">

@@ -7,23 +7,37 @@
     }
 
     const {
+        DEFAULT_PASSING_PERCENT,
         buildCourseMaterialsUrl,
         buildRunnerLogEntry,
         buildRunnerLogMessage,
         classifyQuizStateText,
+        extractGradePercentage,
+        extractPassingThreshold,
         flattenCourseStructure,
+        getItemSlug,
         guessItemType,
         inferSidebarCompletionSignals,
+        isCancelActionLabel,
         isContinueActionLabel,
+        isQuizAttemptLocked,
         isUngradedAppItem,
         isStartActionLabel,
         isSubmitActionLabel,
+        isSubmitConfirmDialogBlocked,
+        isTextQuestionAnswered,
+        isUnansweredNoticeText,
+        checkQuizSubmissionQualityGates,
+        isPathSkipped,
+        isPeerAssignmentSubmitted,
+        matchesItemPath,
         normalizeQuizResultSettleSeconds,
         normalizePath,
         pickFirstIncompleteQuiz,
         resolveAttemptRelayState,
         resolveStartActionState,
         resolveSolverFillState,
+        shouldTreatExistingAttemptAsPassed,
         shouldTreatQuizStateAsFinal,
     } = helpers;
 
@@ -37,7 +51,7 @@
     const QUIZ_RESULT_SETTLE_MS = DEFAULT_QUIZ_RESULT_SETTLE_SECONDS * 1000;
     const ATTEMPT_RELAY_DELAY_MS = 3000;
     const APP_ITEM_STEP_DELAY_MS = 4000;
-    const START_TRANSITION_TIMEOUT_MS = 6000;
+    const START_TRANSITION_TIMEOUT_MS = 8000;
     const SOLVER_FILL_MIN_WAIT_MS = 8000;
     const SOLVER_FILL_STABLE_MS = 5000;
     const SOLVER_FILL_TIMEOUT_MS = 60000;
@@ -50,6 +64,7 @@
     const processingModes = new Set();
     const resumeTimers = new Map();
     let logWriteQueue = Promise.resolve();
+    let cachedPassingThreshold = DEFAULT_PASSING_PERCENT || 80;
 
     window.addEventListener("message", handleInterceptedMessage);
     window.addEventListener("error", handleWindowError);
@@ -73,7 +88,13 @@
     }
 
     function handleWindowError(event) {
-        logRunnerError("runner_error", event.error || event.message || "Unknown window error", {
+        const error = event.error || event.message || "Unknown window error";
+        const msg = String((error && error.message) || error || "");
+        if (/reading 'prompt'/i.test(msg) || /content\.js/i.test(event.filename || "")) {
+            console.warn("Suppressed legacy content.js error:", msg);
+            return;
+        }
+        logRunnerError("runner_error", error, {
             source: event.filename,
             line: event.lineno,
             column: event.colno,
@@ -81,12 +102,25 @@
     }
 
     function handleUnhandledRejection(event) {
-        logRunnerError("runner_error", event.reason || "Unhandled promise rejection");
+        const reason = event.reason || "Unhandled promise rejection";
+        const msg = String((reason && reason.message) || reason || "");
+        if (/reading 'prompt'/i.test(msg)) {
+            console.warn("Suppressed legacy content.js unhandled rejection:", msg);
+            return;
+        }
+        logRunnerError("runner_error", reason);
     }
 
     function handleRuntimeMessage(message, sender, sendResponse) {
         if (!message) {
             return;
+        }
+
+        if (message === "attempt" || message.type === "attempt") {
+            solveQuizDirectlyFromDom({ title: document.title, path: location.pathname }, "manual")
+                .then((result) => sendResponse({ ok: Boolean(result && (result.solved || result === true)) }))
+                .catch((error) => sendResponse({ ok: false, error: error.message }));
+            return true;
         }
 
         if (message.type === "makeDoneAll") {
@@ -128,6 +162,37 @@
                 .catch((error) => sendResponse({ active: false, error: error.message }));
             return true;
         }
+
+        if (message.type === "pauseRun" || message.type === "stopRun") {
+            pauseCurrentRun()
+                .then((result) => sendResponse(result))
+                .catch((error) => sendResponse({ ok: false, error: error.message }));
+            return true;
+        }
+    }
+
+    async function pauseCurrentRun() {
+        for (const [mode, timer] of resumeTimers.entries()) {
+            clearTimeout(timer);
+        }
+        resumeTimers.clear();
+        processingModes.clear();
+
+        await updateRunState(RUN_MODE_FULL, {
+            active: false,
+            status: "paused",
+            lastStatus: "Đã tạm dừng",
+            processing: false,
+        });
+        await updateRunState(RUN_MODE_QUIZ, {
+            active: false,
+            status: "paused",
+            lastStatus: "Đã tạm dừng",
+            processing: false,
+        });
+
+        logRunner("run_paused", { message: "Runner paused by user." });
+        return { ok: true, paused: true };
     }
 
     async function startFullRun(options) {
@@ -365,8 +430,8 @@
             return;
         }
 
-        const settings = await storageGet(["key"]);
-        if (!settings.key) {
+        const settings = await storageGet(["openaiKeys", "groqKeys", "key"]);
+        if (!hasConfiguredAiKey(settings)) {
             logRunner(
                 mode === RUN_MODE_QUIZ ? "quiz_run_skipped" : "quiz_skipped_missing_key",
                 {
@@ -381,25 +446,24 @@
         await ensureQuizModeEnabled(mode, state);
 
         const currentPath = normalizePath(window.location.pathname);
-        if (!/\/attempt$/.test(currentPath)) {
-            const attemptPath = findAttemptPath(item.path);
-            if (attemptPath && attemptPath !== currentPath) {
-                await updateRunState(mode, {
-                    status: "waitingForPage",
-                    lastStatus: `Opening quiz ${item.title}`,
-                });
-                logRunner(
-                    mode === RUN_MODE_QUIZ ? "quiz_run_open_attempt" : "quiz_open_attempt",
-                    {
-                        ...summarizeItem(item),
-                        attemptPath,
-                    },
-                    { mode }
-                );
-                logRunner("wait_page_load", { seconds: getResumeDelaySeconds() }, { mode });
-                navigateTo(attemptPath, mode);
-                return;
-            }
+        const attemptPath = findAttemptPath(item.path);
+
+        if (!matchesItemPath(currentPath, item.path)) {
+            await updateRunState(mode, {
+                status: "waitingForPage",
+                lastStatus: `Opening quiz ${item.title}`,
+            });
+            logRunner(
+                mode === RUN_MODE_QUIZ ? "quiz_run_open_attempt" : "quiz_open_attempt",
+                {
+                    ...summarizeItem(item),
+                    attemptPath,
+                },
+                { mode }
+            );
+            logRunner("wait_page_load", { seconds: getResumeDelaySeconds() }, { mode });
+            navigateTo(item.path, mode);
+            return;
         }
 
         await updateRunState(mode, {
@@ -556,7 +620,13 @@
             return;
         }
 
-        const skippedPaths = Array.from(new Set([...(state.skippedPaths || []), item.path]));
+        const currentPath = normalizePath(window.location.pathname);
+        const currentIsSameItem = Boolean(currentPath && matchesItemPath(currentPath, item.path));
+        const skippedPaths = Array.from(new Set([
+            ...(state.skippedPaths || []),
+            item.path,
+            ...(currentIsSameItem ? [currentPath] : []),
+        ]));
         const skipLog = [
             ...(state.skipLog || []),
             {
@@ -611,12 +681,23 @@
         let solverFillLastSignature = "";
         let solverFillLastChangedAt = 0;
         let submissionClicked = false;
+        let submissionClickedAt = 0;
         let confirmClicked = false;
         let submitConfirmedAt = 0;
         let startClickedAt = 0;
         let quizControlsReadyAt = 0;
         let attemptRelayDelayLogged = false;
         let waitingForQuizControlsLogged = false;
+        let waitingForControlsStartAt = 0;
+        let visionTriedInWaitingControls = false;
+        let quizRetryCount = 0;
+        let aiSolveAttempts = 0;
+        let currentAttemptSubmission = null;
+        try {
+            const saved = sessionStorage.getItem("autocoursera:lastSubmission");
+            if (saved) currentAttemptSubmission = JSON.parse(saved);
+        } catch (e) {}
+        let viewFeedbackVisited = false;
 
         while (Date.now() - startedAt < timeoutMs) {
             const state = await getRunState(mode);
@@ -629,50 +710,371 @@
                 return completionOutcome;
             }
 
-            const pageText = cleanText(document.body && document.body.textContent);
-            const quizState = classifyQuizStateText(pageText);
+            const currentPath = normalizePath(window.location.pathname);
+            const isFeedbackUrl = /\/(view-feedback|feedback)$/i.test(currentPath);
+            const pageText = getMainContentText();
+            const quizState = classifyQuizStateText(pageText, cachedPassingThreshold);
+            const isAttemptUrl = /\/attempt$/i.test(currentPath);
+            const isSubmitUrl = /\/submit$/i.test(currentPath);
+            const isPeerItem = /\/peer\//i.test(currentItem.path) || /\/peer\//i.test(currentPath);
             const nextButton = findNextItemButton();
-            const startButton = findStartQuizButton();
+            const startButton = (isAttemptUrl || isSubmitUrl) ? null : findStartQuizButton();
             const agreementCheckbox = findHonorCodeCheckbox();
-            const submitButton = findActionButton(isSubmitActionLabel);
-            const hasQuizWorkControls = Boolean(agreementCheckbox || submitButton);
+            const submitButton = findSubmitButton();
+            const questionPart = document.querySelector(
+                '.rc-FormPartsQuestion, [data-testid*="question" i], [class*="FormPartsQuestion" i], [class*="quiz-question" i], fieldset[class*="question" i], main input[type="radio"], [role="main"] input[type="radio"]'
+            );
+            const hasSubmissionInputs = Boolean(
+                document.querySelector('div[contenteditable="true"], div[role="textbox"], textarea, input:not([type]), input[type="text"], input[placeholder*="title" i], [class*="MySubmission" i]')
+            );
+            const hasChoiceInputs = Boolean(questionPart || (isAttemptUrl && document.querySelector('input[type="radio"], input[type="checkbox"], textarea, [role="radio"], [role="checkbox"]')));
+            const hasQuizWorkControls = Boolean(
+                (submitButton || hasSubmissionInputs || (hasChoiceInputs && isAttemptUrl) || (agreementCheckbox && isAttemptUrl)) &&
+                !startButton
+            );
 
-            if (shouldTreatQuizStateAsFinal(quizState, submissionClicked) && quizState === "passed") {
+            const isInteractiveWorkPage = isAttemptUrl || isSubmitUrl || hasSubmissionInputs;
+            const isCoverPage = !isInteractiveWorkPage && !isFeedbackUrl;
+            const hasFailedBanner = /(you didn't pass|did not pass|not passed|try again|failed|chưa đạt)/i.test(pageText);
+            const viewFeedbackButton = findViewFeedbackButton();
+
+            // If on peer assignment item but not yet on submission form (e.g. Instructions tab):
+            if (isPeerItem && !isInteractiveWorkPage) {
+                const mySubTab = Array.from(document.querySelectorAll('button, a, [role="tab"]')).find((el) => {
+                    const txt = cleanText(el.textContent);
+                    return /^(my submission|bài nộp của tôi)/i.test(txt) || (el.getAttribute && el.getAttribute("href") && el.getAttribute("href").includes("/submit"));
+                });
+                if (mySubTab) {
+                    logRunner("peer_tab_click_my_submission", summarizeItem(currentItem), { mode });
+                    safeClick(mySubTab);
+                    await delay(2500);
+                    continue;
+                }
+                const attemptPath = findAttemptPath(currentItem.path);
+                if (attemptPath && !matchesItemPath(location.pathname, attemptPath)) {
+                    navigateTo(attemptPath, mode);
+                    await delay(3000);
+                    continue;
+                }
+            }
+
+            if (state.viewFeedbackHandledFor === currentItem.path) {
+                viewFeedbackVisited = true;
+            }
+
+            // 1. If currently on feedback page:
+            if (isFeedbackUrl) {
+                viewFeedbackVisited = true;
+                if (!state.viewFeedbackHandledFor || state.viewFeedbackHandledFor !== currentItem.path) {
+                    await updateRunState(mode, { viewFeedbackHandledFor: currentItem.path });
+                }
+
+                // If quiz already passed on feedback page
+                if (quizState === "passed") {
+                    await recordQuizResults(currentItem, "passed", currentAttemptSubmission);
+                    await markItemCompleted(mode, currentItem);
+                    logRunner("quiz_result_passed", summarizeItem(currentItem));
+
+                    const settled = hasQuizResultSettled(submitConfirmedAt, quizResultSettleMs);
+                    if (settled) {
+                        if (nextButton) {
+                            logRunner("quiz_click_next_item", summarizeItem(currentItem));
+                            activateNextItem(nextButton, mode);
+                            logRunner("wait_page_load", { seconds: getResumeDelaySeconds() }, { mode });
+                        }
+                        const passedOutcome = await waitForCompletionShift(mode, currentItem);
+                        if (passedOutcome) {
+                            return passedOutcome;
+                        }
+                        const stateAfterComplete = await getRunState(mode);
+                        if (stateAfterComplete && stateAfterComplete.active) {
+                            const courseItems = await getOrderedCourseItems(stateAfterComplete.courseSlug);
+                            if (courseItems && courseItems.length) {
+                                const completionMap = buildEffectiveCompletionMap(courseItems, stateAfterComplete);
+                                completionMap.set(currentItem.path, true);
+                                const cleanItemPath = normalizePath(currentItem.path).replace(/\/(attempt|view-feedback|instructions|feedback|submit|give-feedback|review)$/i, "");
+                                completionMap.set(cleanItemPath, true);
+
+                                const nextPendingItem = pickNextItemForMode(
+                                    mode,
+                                    courseItems,
+                                    completionMap,
+                                    new Set(stateAfterComplete.skippedPaths || [])
+                                );
+                                if (nextPendingItem && !matchesItemPath(nextPendingItem.path, currentItem.path)) {
+                                    logRunner("navigate_to_item", summarizeItem(nextPendingItem), { mode });
+                                    return { kind: "moved", nextItem: nextPendingItem };
+                                } else if (!nextPendingItem) {
+                                    return { kind: "done" };
+                                }
+                            }
+                        }
+                    }
+                    await delay(POLL_INTERVAL_MS);
+                    continue;
+                }
+
+                // Quiz did not pass: extract all review/feedback text of the frame into memory
+                await delay(1500);
+                if (typeof ensureAllQuizContentScrolledAndLoaded === "function") {
+                    await ensureAllQuizContentScrolledAndLoaded(mode);
+                }
+                if (!currentAttemptSubmission) {
+                    try {
+                        const saved = sessionStorage.getItem("autocoursera:lastSubmission");
+                        if (saved) currentAttemptSubmission = JSON.parse(saved);
+                    } catch (e) {}
+                }
+                await recordQuizResults(currentItem, "failed", currentAttemptSubmission);
+                logRunner("quiz_feedback_inspected", summarizeItem(currentItem), { mode });
+                await updateRunState(mode, {
+                    lastStatus: `Inspected feedback for ${currentItem.title}. Returning to summary.`,
+                });
+
+                // "sau đó phải bấm quay lại màn hình dạng này": Return back to the cover page
+                const backBtn = findFeedbackBackButton();
+                logRunner("quiz_feedback_back_clicked", summarizeItem(currentItem), { mode });
+                if (backBtn) {
+                    safeClick(backBtn);
+                    await delay(2000);
+                }
+
+                if (/\/(view-feedback|feedback)$/i.test(normalizePath(window.location.pathname))) {
+                    if (window.history.length > 1) {
+                        window.history.back();
+                        await delay(2000);
+                    }
+                }
+
+                if (/\/(view-feedback|feedback)$/i.test(normalizePath(window.location.pathname))) {
+                    const cleanCoverPath = normalizePath(currentItem.path).replace(/\/(attempt|view-feedback|instructions|feedback)$/i, "");
+                    navigateTo(cleanCoverPath, mode);
+                    await delay(3000);
+                }
+
+                continue;
+            }
+
+            // 2. If on cover page and failed banner/feedback button is visible, inspect feedback ONLY ONCE
+            if (isCoverPage && (hasFailedBanner || Boolean(viewFeedbackButton)) && !viewFeedbackVisited && state.viewFeedbackHandledFor !== currentItem.path) {
+                if (viewFeedbackButton) {
+                    viewFeedbackVisited = true;
+                    logRunner("quiz_open_view_feedback_to_learn", summarizeItem(currentItem), { mode });
+                    await updateRunState(mode, {
+                        viewFeedbackHandledFor: currentItem.path,
+                        lastStatus: `Opening View Feedback to inspect errors for ${currentItem.title}`,
+                    });
+                    safeClick(viewFeedbackButton);
+                    await delay(2000);
+                    if (normalizePath(window.location.pathname) === currentPath) {
+                        const cleanItem = normalizePath(currentItem.path).replace(/\/(attempt|view-feedback|instructions|feedback)$/i, "");
+                        navigateTo(`${cleanItem}/view-feedback`, mode);
+                    }
+                    await delay(3000);
+                    continue;
+                }
+            }
+
+            // 3. Check if quiz already passed
+            const hasEnabledCoverStart = Boolean(
+                isCoverPage &&
+                startButton &&
+                !isButtonDisabled(startButton) &&
+                /^(start|begin|resume|open)/i.test(cleanText(getButtonLabel(startButton)))
+            );
+            const hasSubmitAction = Boolean(submitButton && !isButtonDisabled(submitButton));
+            const isPeerSubmitted = isPeerAssignmentSubmitted
+                ? isPeerAssignmentSubmitted({
+                    isPeerItem,
+                    isSubmitUrl,
+                    hasSubmissionInputs,
+                    hasSubmitAction,
+                    pageText,
+                    justSubmitted: Boolean(confirmClicked || (submissionClicked && submitConfirmedAt > 0)),
+                })
+                : Boolean(isPeerItem && (
+                    (confirmClicked || (submissionClicked && submitConfirmedAt > 0))
+                        ? (/(you('ve| have) submitted|your assignment has been submitted|submission received|đã nộp bài)/i.test(pageText) || !hasSubmitAction || !hasSubmissionInputs || (Date.now() - submitConfirmedAt > 4000))
+                        : (!isSubmitUrl && !hasSubmissionInputs && !hasSubmitAction && /(you('ve| have) submitted|your assignment has been submitted|submission received|đã nộp bài)/i.test(pageText))
+                ));
+
+            const isQuizPassed = !hasEnabledCoverStart && (
+                quizState === "passed" ||
+                isPeerSubmitted ||
+                (typeof shouldTreatExistingAttemptAsPassed === "function" && shouldTreatExistingAttemptAsPassed({
+                    quizState,
+                    hasNextButton: Boolean(nextButton),
+                    startLabel: startButton ? getButtonLabel(startButton) : "",
+                    pageText,
+                    passingThreshold: cachedPassingThreshold,
+                })));
+
+            const isFinalState =
+                shouldTreatQuizStateAsFinal(quizState, submissionClicked) ||
+                Boolean(isPeerSubmitted && (confirmClicked || !isInteractiveWorkPage)) ||
+                Boolean(isQuizPassed && nextButton && (!isInteractiveWorkPage || confirmClicked));
+
+            if (isFinalState && isQuizPassed) {
+                await recordQuizResults(currentItem, "passed", currentAttemptSubmission);
                 await markItemCompleted(mode, currentItem);
                 logRunner("quiz_result_passed", summarizeItem(currentItem));
-                if (nextButton && hasQuizResultSettled(submitConfirmedAt, quizResultSettleMs)) {
-                    logRunner("quiz_click_next_item", summarizeItem(currentItem));
-                    activateNextItem(nextButton);
-                    logRunner("wait_page_load", { seconds: getResumeDelaySeconds() }, { mode });
-                    await delay(POLL_INTERVAL_MS);
-                }
 
-                const continueClicked =
-                    hasQuizResultSettled(submitConfirmedAt, quizResultSettleMs) &&
-                    clickFirstMatchingButton(isContinueActionLabel);
-                if (continueClicked) {
-                    logRunner("quiz_click_continue", summarizeItem(currentItem));
-                    await updateRunState(mode, {
-                        lastStatus: `Continuing after ${currentItem.title}`,
-                    });
-                }
+                const settled = hasQuizResultSettled(submitConfirmedAt, quizResultSettleMs);
+                if (settled) {
+                    const stateAfterComplete = await getRunState(mode);
+                    const courseItems = (stateAfterComplete && stateAfterComplete.active && stateAfterComplete.courseSlug)
+                        ? await getOrderedCourseItems(stateAfterComplete.courseSlug)
+                        : [];
 
-                const passedOutcome = await waitForCompletionShift(mode, currentItem);
-                if (passedOutcome) {
-                    return passedOutcome;
+                    // Explicitly mark currentItem as completed in the completion map for picking next item
+                    const completionMap = buildEffectiveCompletionMap(courseItems, stateAfterComplete);
+                    completionMap.set(currentItem.path, true);
+                    const cleanItemPath = normalizePath(currentItem.path).replace(/\/(attempt|view-feedback|instructions|feedback|submit|give-feedback|review)$/i, "");
+                    completionMap.set(cleanItemPath, true);
+
+                    const nextPendingItem = pickNextItemForMode(
+                        mode,
+                        courseItems,
+                        completionMap,
+                        new Set((stateAfterComplete && stateAfterComplete.skippedPaths) || [])
+                    );
+
+                    if (nextPendingItem && !matchesItemPath(nextPendingItem.path, currentItem.path)) {
+                        logRunner("navigate_to_item", summarizeItem(nextPendingItem), { mode });
+                        if (nextButton) {
+                            activateNextItem(nextButton, mode);
+                        } else {
+                            navigateTo(nextPendingItem.path, mode);
+                        }
+                        return { kind: "moved", nextItem: nextPendingItem };
+                    }
+
+                    if (!nextPendingItem && courseItems.length > 0) {
+                        return { kind: "done" };
+                    }
+
+                    if (nextButton) {
+                        logRunner("quiz_click_next_item", summarizeItem(currentItem));
+                        activateNextItem(nextButton, mode);
+                        logRunner("wait_page_load", { seconds: getResumeDelaySeconds() }, { mode });
+                    }
+
+                    const continueClicked = clickFirstMatchingButton(isContinueActionLabel);
+                    if (continueClicked) {
+                        logRunner("quiz_click_continue", summarizeItem(currentItem));
+                        await updateRunState(mode, {
+                            lastStatus: `Continuing after ${currentItem.title}`,
+                        });
+                    }
+
+                    const passedOutcome = await waitForCompletionShift(mode, currentItem);
+                    if (passedOutcome) {
+                        return passedOutcome;
+                    }
                 }
 
                 await delay(POLL_INTERVAL_MS);
                 continue;
             }
 
+            // 4. Check if retry button exists and if attempt is locked (e.g. 24h lockout)
+            const retryButton = findRetryQuizButton();
+            const isRetryDisabled = Boolean(retryButton && isButtonDisabled(retryButton));
+            const isStartDisabled = Boolean(startButton && isButtonDisabled(startButton));
+            const hasEnabledStart = Boolean(startButton && !isStartDisabled);
+
+            const isLocked = CourseRunnerHelpers && typeof CourseRunnerHelpers.isQuizAttemptLocked === "function"
+                ? CourseRunnerHelpers.isQuizAttemptLocked({
+                    pageText,
+                    hasRetryButton: Boolean(retryButton),
+                    retryButtonDisabled: isRetryDisabled,
+                    hasEnabledStartButton: hasEnabledStart,
+                    hasFailedBanner,
+                })
+                : Boolean((retryButton && isRetryDisabled) || /0\s*of\s*\d+\s*attempt/i.test(pageText));
+
+            // If "Try again" is locked (24-hour lockout or maximum attempts reached): skip to next item/quiz
+            if (isCoverPage && isLocked) {
+                logRunner("quiz_attempt_locked", {
+                    ...summarizeItem(currentItem),
+                    reason: "Quiz attempts locked for 24 hours (Try again is disabled)",
+                }, { mode });
+                await updateRunState(mode, {
+                    lastStatus: `Quiz ${currentItem.title} locked (24-hour limit reached). Moving to next item.`,
+                });
+                await recordQuizResults(currentItem, "failed", currentAttemptSubmission);
+                return {
+                    kind: "failed",
+                    reason: `Quiz ${currentItem.title} is locked for 24 hours (attempt limit reached, Try again disabled).`,
+                };
+            }
+
+            // 5. If "Try again" is enabled: retry the quiz
+            if (retryButton && !isButtonDisabled(retryButton)) {
+                await recordQuizResults(currentItem, "failed", currentAttemptSubmission);
+                const maxQuizRetries = await getQuizMaxRetries();
+                if (quizRetryCount < maxQuizRetries) {
+                    quizRetryCount++;
+                    logRunner("quiz_retry_attempt", {
+                        ...summarizeItem(currentItem),
+                        attemptNumber: quizRetryCount + 1,
+                        maxRetries: maxQuizRetries,
+                    }, { mode });
+                    await updateRunState(mode, {
+                        lastStatus: `Retrying quiz ${currentItem.title} (attempt ${quizRetryCount + 1}/${maxQuizRetries + 1})`,
+                    });
+                    safeClick(retryButton);
+                    attemptRelayed = false;
+                    attemptRelayedAt = 0;
+                    answerBaseline = null;
+                    solverFillReady = false;
+                    solverFillWaitLogged = false;
+                    solverFillLastSignature = "";
+                    solverFillLastChangedAt = 0;
+                    submissionClicked = false;
+                    submissionClickedAt = 0;
+                    confirmClicked = false;
+                    submitConfirmedAt = 0;
+                    startClickedAt = 0;
+                    quizControlsReadyAt = 0;
+                    attemptRelayDelayLogged = false;
+                    waitingForQuizControlsLogged = false;
+                    waitingForControlsStartAt = 0;
+                    visionTriedInWaitingControls = false;
+                    currentAttemptSubmission = null;
+                    await delay(2000);
+                    continue;
+                } else if (shouldTreatQuizStateAsFinal(quizState, submissionClicked)) {
+                    logRunner("quiz_result_failed", summarizeItem(currentItem));
+                    return { kind: "failed", reason: "Quiz submitted but did not pass." };
+                }
+            }
+
             if (shouldTreatQuizStateAsFinal(quizState, submissionClicked) && quizState === "failed") {
+                await recordQuizResults(currentItem, "failed", currentAttemptSubmission);
                 logRunner("quiz_result_failed", summarizeItem(currentItem));
                 return { kind: "failed", reason: "Quiz submitted but did not pass." };
             }
 
+            const startModalButton = findStartAttemptModalConfirmButton();
+            if (startModalButton && !isButtonDisabled(startModalButton)) {
+                logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("before_start_modal_confirm", currentItem), { mode });
+                safeClick(startModalButton);
+                startClickedAt = Date.now();
+                waitingForQuizControlsLogged = false;
+                waitingForControlsStartAt = 0;
+                logRunner("quiz_click_modal_continue", summarizeItem(currentItem), { mode });
+                logRunner("wait_page_load", { seconds: 5 }, { mode });
+                await updateRunState(mode, {
+                    lastStatus: `Confirmed start attempt for ${currentItem.title}`,
+                });
+                await delay(2000);
+                continue;
+            }
+
             const startAction = resolveStartActionState({
                 hasStartButton: Boolean(startButton && !isButtonDisabled(startButton)),
+                hasStartModalButton: Boolean(startModalButton && !isButtonDisabled(startModalButton)),
                 hasQuizWorkControls,
                 startClickedAt,
                 now: Date.now(),
@@ -681,9 +1083,12 @@
 
             if (startAction === "click") {
                 logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("before_start_click", currentItem), { mode });
+                const anchorHref = (startButton.getAttribute && startButton.getAttribute("href")) ||
+                    (startButton.closest && startButton.closest("a[href]") && startButton.closest("a[href]").getAttribute("href"));
                 safeClick(startButton);
                 startClickedAt = Date.now();
                 waitingForQuizControlsLogged = false;
+                waitingForControlsStartAt = 0;
                 logRunner("quiz_click_start", summarizeItem(currentItem), { mode });
                 logRunner("wait_page_load", {
                     seconds: Math.ceil(START_TRANSITION_TIMEOUT_MS / 1000),
@@ -691,6 +1096,14 @@
                 await updateRunState(mode, {
                     lastStatus: `Started quiz ${currentItem.title}`,
                 });
+                if (anchorHref && !anchorHref.startsWith("#") && !anchorHref.startsWith("javascript:")) {
+                    await delay(1500);
+                    if (normalizePath(location.pathname) === currentPath) {
+                        navigateTo(anchorHref, mode);
+                        await delay(2000);
+                        continue;
+                    }
+                }
                 await delay(POLL_INTERVAL_MS);
                 continue;
             }
@@ -701,6 +1114,43 @@
             }
 
             if (startAction === "timeout") {
+                const lateModalButton = findStartAttemptModalConfirmButton();
+                if (lateModalButton && !isButtonDisabled(lateModalButton)) {
+                    safeClick(lateModalButton);
+                    startClickedAt = Date.now();
+                    logRunner("quiz_click_modal_continue", summarizeItem(currentItem), { mode });
+                    await delay(2000);
+                    continue;
+                }
+
+                // If on cover page, navigate directly to attempt path as primary fallback!
+                const attemptPath = findAttemptPath(currentItem.path);
+                if (attemptPath && !matchesItemPath(location.pathname, attemptPath)) {
+                    logRunner("quiz_open_attempt_direct", {
+                        ...summarizeItem(currentItem),
+                        attemptPath,
+                    }, { mode });
+                    navigateTo(attemptPath, mode);
+                    await delay(3000);
+                    continue;
+                }
+
+                // AI Vision Fallback: inspect screenshot and click any blocking button/modal
+                const visionClicked = await attemptVisionNavigationFallback(currentItem, mode, "start_transition_timeout");
+                if (visionClicked) {
+                    await delay(2500);
+                    if (!/\/attempt$/i.test(location.pathname) && attemptPath && attemptPath !== normalizePath(location.pathname)) {
+                        navigateTo(attemptPath, mode);
+                        await delay(3000);
+                        continue;
+                    }
+                    startClickedAt = Date.now();
+                    waitingForQuizControlsLogged = false;
+                    waitingForControlsStartAt = 0;
+                    await delay(1000);
+                    continue;
+                }
+
                 logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("start_transition_timeout", currentItem), { mode });
                 logRunnerWarn("quiz_error", {
                     ...summarizeItem(currentItem),
@@ -718,10 +1168,77 @@
                 if (!waitingForQuizControlsLogged) {
                     logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("waiting_for_quiz_controls", currentItem), { mode });
                     waitingForQuizControlsLogged = true;
+                    waitingForControlsStartAt = Date.now();
+                }
+
+                // If stuck waiting for controls for over 8 seconds and no start button is present
+                if (
+                    !visionTriedInWaitingControls &&
+                    waitingForControlsStartAt > 0 &&
+                    Date.now() - waitingForControlsStartAt > 8000
+                ) {
+                    visionTriedInWaitingControls = true;
+                    // Check if attempt link or resume button appeared late
+                    const lateStart = findStartQuizButton();
+                    if (lateStart) {
+                        safeClick(lateStart);
+                        startClickedAt = Date.now();
+                        waitingForControlsStartAt = 0;
+                        await delay(2000);
+                        continue;
+                    }
+                    const attemptPath = findAttemptPath(currentItem.path);
+                    if (attemptPath && !matchesItemPath(location.pathname, attemptPath)) {
+                        navigateTo(attemptPath, mode);
+                        await delay(3000);
+                        continue;
+                    }
+                    const visionClicked = await attemptVisionNavigationFallback(currentItem, mode, "waiting_for_controls_stuck");
+                    if (visionClicked) {
+                        waitingForControlsStartAt = Date.now();
+                        await delay(3000);
+                        continue;
+                    }
+                }
+
+                // Only give up on a truly non-interactive item: cover page, no Start button at all,
+                // no question inputs, after a long wait (slow pages must not be skipped).
+                if (
+                    waitingForControlsStartAt > 0 &&
+                    Date.now() - waitingForControlsStartAt > 30000 &&
+                    !isInteractiveWorkPage &&
+                    !findStartQuizButton() &&
+                    !findStartAttemptModalConfirmButton() &&
+                    !hasChoiceInputs
+                ) {
+                    // Check if page has Next / Continue / Mark as completed button
+                    const nextBtn = findNextItemButton();
+                    if (nextBtn) {
+                        logRunner("assignment_click_next", summarizeItem(currentItem), { mode });
+                        activateNextItem(nextBtn, mode);
+                        await delay(2500);
+                        const passedOutcome = await waitForCompletionShift(mode, currentItem);
+                        if (passedOutcome) return passedOutcome;
+                    }
+
+                    // Otherwise, this is a non-interactive assignment (requires manual upload/Visio diagram/submission)
+                    logRunnerWarn("non_interactive_assignment", {
+                        ...summarizeItem(currentItem),
+                        message: "No quiz controls or attempt found. Skipping non-interactive assignment.",
+                    });
+                    return {
+                        kind: "failed",
+                        reason: `Non-interactive assignment (manual submission required): ${currentItem.title}`,
+                    };
                 }
 
                 await delay(POLL_INTERVAL_MS);
                 continue;
+            }
+
+            if (hasQuizWorkControls) {
+                waitingForControlsStartAt = 0;
+                visionTriedInWaitingControls = false;
             }
 
             if (!attemptRelayed && !quizControlsReadyAt) {
@@ -753,28 +1270,79 @@
                 answerBaseline = getQuizAnswerProgress();
                 solverFillLastSignature = answerBaseline.signature;
                 solverFillLastChangedAt = Date.now();
-                const relayResult = await relayTabMessage("attempt");
-                if (!relayResult.ok) {
-                    console.warn("Quiz relay reported an error:", relayResult.error);
-                    logRunnerWarn("quiz_error", {
-                        ...summarizeItem(currentItem),
-                        message: relayResult.error || "Quiz relay reported an error.",
-                    });
+
+                // 1. Direct DOM Quiz Solver
+                let directSolved = false;
+                try {
+                    const solveResult = await solveQuizDirectlyFromDom(currentItem, mode);
+                    if (solveResult) {
+                        directSolved = Boolean(solveResult.solved || solveResult === true);
+                        if (solveResult.submission) {
+                            currentAttemptSubmission = solveResult.submission;
+                            try {
+                                sessionStorage.setItem("autocoursera:lastSubmission", JSON.stringify(solveResult.submission));
+                            } catch (e) {}
+                        }
+                    }
+                } catch (domErr) {
+                    console.warn("Direct DOM quiz solver error:", domErr);
                 }
 
-                attemptRelayed = true;
-                attemptRelayedAt = Date.now();
-                logRunner("quiz_attempt_relayed", {
-                    ...summarizeItem(currentItem),
-                    relayOk: relayResult.ok,
-                    relayError: relayResult.error,
-                }, { mode });
-                logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("after_attempt_relay", currentItem), { mode });
-                await updateRunState(mode, {
-                    lastStatus: `Solving quiz ${currentItem.title}`,
-                });
-                await delay(POLL_INTERVAL_MS);
-                continue;
+                if (directSolved) {
+                    aiSolveAttempts = 0;
+                    attemptRelayed = true;
+                    attemptRelayedAt = Date.now();
+                    solverFillReady = true;
+                    logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("after_direct_solve", currentItem), { mode });
+                    await updateRunState(mode, {
+                        lastStatus: `Solved quiz ${currentItem.title}`,
+                    });
+                    await delay(1000);
+                    continue;
+                }
+
+                // 2. Fallback to relayTabMessage ONLY if there are no extractable DOM questions
+                const domQuestions = extractQuizQuestionsFromDom();
+                if (!domQuestions.length) {
+                    const relayResult = await relayTabMessage("attempt");
+                    if (!relayResult.ok) {
+                        console.warn("Quiz relay reported an error:", relayResult.error);
+                        logRunnerWarn("quiz_error", {
+                            ...summarizeItem(currentItem),
+                            message: relayResult.error || "Quiz relay reported an error.",
+                        });
+                    }
+
+                    attemptRelayed = true;
+                    attemptRelayedAt = Date.now();
+                    logRunner("quiz_attempt_relayed", {
+                        ...summarizeItem(currentItem),
+                        relayOk: relayResult.ok,
+                        relayError: relayResult.error,
+                    }, { mode });
+                    logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("after_attempt_relay", currentItem), { mode });
+                    await updateRunState(mode, {
+                        lastStatus: `Solving quiz ${currentItem.title}`,
+                    });
+                    await delay(POLL_INTERVAL_MS);
+                    continue;
+                } else {
+                    aiSolveAttempts++;
+                    if (aiSolveAttempts >= 3) {
+                        logRunnerWarn("quiz_ai_failed_max_retries", {
+                            ...summarizeItem(currentItem),
+                            attempts: aiSolveAttempts,
+                        }, { mode });
+                        await updateRunState(mode, {
+                            active: false,
+                            status: "paused",
+                            lastStatus: "Lỗi AI sau 3 lần thử. Đã dừng lại để bạn kiểm tra.",
+                        });
+                        return { kind: "failed", reason: "AI solve failed after 3 attempts." };
+                    }
+                    await delay(4000);
+                    continue;
+                }
             }
 
             if (!solverFillReady) {
@@ -851,6 +1419,34 @@
             if (submissionClicked && !confirmClicked) {
                 const confirmSubmitButton = findConfirmSubmitButton();
                 if (confirmSubmitButton && !isButtonDisabled(confirmSubmitButton)) {
+                    // Quality Gate: Check confirmation dialog content to ensure Coursera is not warning about unanswered questions
+                    const dialog = confirmSubmitButton.closest && confirmSubmitButton.closest(
+                        '[role="dialog"], [aria-modal="true"], .cds-modal, [class*="dialog" i], [class*="modal" i]'
+                    );
+                    const dialogText = dialog ? cleanText(dialog.textContent) : "";
+
+                    if (CourseRunnerHelpers && CourseRunnerHelpers.isSubmitConfirmDialogBlocked && CourseRunnerHelpers.isSubmitConfirmDialogBlocked(dialogText)) {
+                        logRunnerWarn("quiz_confirm_blocked_unanswered_in_dialog", {
+                            ...summarizeItem(currentItem),
+                            dialogText: dialogText.slice(0, 200),
+                        }, { mode });
+
+                        const cancelBtn = dialog
+                            ? (dialog.querySelector('button[class*="cancel" i], button[aria-label*="cancel" i], [data-testid*="cancel" i]') ||
+                               Array.from(dialog.querySelectorAll('button, [role="button"]')).find((b) => CourseRunnerHelpers.isCancelActionLabel(getButtonLabel(b))))
+                            : null;
+
+                        if (cancelBtn) {
+                            safeClick(cancelBtn);
+                        }
+
+                        submissionClicked = false;
+                        submissionClickedAt = 0;
+                        confirmClicked = false;
+                        await delay(2000);
+                        continue;
+                    }
+
                     logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("before_confirm_submit", currentItem), { mode });
                     safeClick(confirmSubmitButton);
                     confirmClicked = true;
@@ -866,14 +1462,60 @@
                     continue;
                 }
 
+                // If submission was clicked but no confirmation modal appeared within 3.5s, treat submit as direct!
+                if (submissionClickedAt && Date.now() - submissionClickedAt > 3500) {
+                    const anyModal = document.querySelector('[role="dialog"], [aria-modal="true"], .cds-modal, [class*="dialog" i], [class*="modal" i]');
+                    if (!anyModal) {
+                        confirmClicked = true;
+                        submitConfirmedAt = Date.now();
+                        logRunner("quiz_confirm_submit_direct", summarizeItem(currentItem), { mode });
+                        await updateRunState(mode, {
+                            lastStatus: `Submitted directly without dialog for ${currentItem.title}`,
+                        });
+                        await delay(POLL_INTERVAL_MS);
+                        continue;
+                    }
+                }
+
                 await delay(POLL_INTERVAL_MS);
                 continue;
             }
 
-            if (!submissionClicked && submitButton && !isButtonDisabled(submitButton)) {
+            const currentSubmitButton = (submitButton && !isButtonDisabled(submitButton))
+                ? submitButton
+                : findSubmitButton();
+
+            if (!submissionClicked && currentSubmitButton && !isButtonDisabled(currentSubmitButton)) {
+                // Quality Gate: verify 100% of questions are answered and no validation errors exist
+                const currentQuestions = extractQuizQuestionsFromDom();
+                const unansweredQuestions = currentQuestions.filter((q) => !validateQuestionElementAnswered(q));
+                const domErrors = findDomValidationErrors();
+
+                if (unansweredQuestions.length > 0 || domErrors.length > 0) {
+                    logRunnerWarn("quiz_submit_blocked_by_quality_gate", {
+                        ...summarizeItem(currentItem),
+                        totalQuestions: currentQuestions.length,
+                        unansweredCount: unansweredQuestions.length,
+                        unansweredPrompts: unansweredQuestions.map((q) => q.question.slice(0, 60)),
+                        errors: domErrors,
+                    }, { mode });
+
+                    if (unansweredQuestions.length > 0) {
+                        await attemptAutoFillMissingQuestions(unansweredQuestions, currentItem, mode);
+                    }
+
+                    await delay(2000);
+                    continue;
+                }
+
                 logRunner("quiz_dom_snapshot", buildQuizDomSnapshot("before_submit_click", currentItem), { mode });
-                safeClick(submitButton);
+                try {
+                    currentSubmitButton.scrollIntoView({ behavior: "smooth", block: "center" });
+                } catch (_) {}
+                await delay(400);
+                safeClick(currentSubmitButton);
                 submissionClicked = true;
+                submissionClickedAt = Date.now();
                 logRunner("quiz_click_submit", summarizeItem(currentItem));
                 await updateRunState(mode, {
                     lastStatus: `Submitted quiz ${currentItem.title}`,
@@ -1001,6 +1643,7 @@
     }
 
     async function getOrderedCourseItems(slug) {
+        await getQuizPassingThreshold();
         const domItems = extractCourseItemsFromDom(slug);
         if (domItems.length) {
             return domItems;
@@ -1008,6 +1651,26 @@
 
         const payload = await getCourseMaterials(slug);
         return flattenCourseStructure(payload);
+    }
+
+    function checkElementHasSuccessIcon(scope) {
+        if (!scope) return false;
+        if (scope.querySelector) {
+            if (scope.querySelector('[data-testid="learn-item-success-icon"], [data-testid*="success-icon" i], [data-testid*="completed-icon" i], [data-testid*="check-icon" i]')) {
+                return true;
+            }
+            if (scope.querySelector('svg[aria-label*="Completed" i], svg[aria-label*="completed" i], svg[aria-label*="Đã hoàn thành" i], [aria-label*="Completed" i], [aria-label*="Đã hoàn thành" i]')) {
+                return true;
+            }
+            if (scope.querySelector('[class*="successIcon" i], [class*="completedIcon" i], [class*="item-success" i]')) {
+                return true;
+            }
+        }
+        const scopeAria = cleanText((scope.getAttribute && scope.getAttribute("aria-label")) || "").toLowerCase();
+        if (/^(completed|đã hoàn thành):/i.test(scopeAria) || /\b(completed|đã hoàn thành)\b/i.test(scopeAria)) {
+            return true;
+        }
+        return false;
     }
 
     function extractCourseItemsFromDom(slug) {
@@ -1032,6 +1695,10 @@
             const container = anchor.closest("li, [role='treeitem'], [class], [data-testid]");
             const title = cleanText(anchor.textContent) || cleanText(container && container.textContent) || path;
             const completed = inferCompletion(container);
+            const iconScope = anchor.closest("li, [role='treeitem']") || container;
+            const hasSuccessIcon = Boolean(
+                checkElementHasSuccessIcon(iconScope) || checkElementHasSuccessIcon(anchor) || checkElementHasSuccessIcon(container)
+            );
 
             seen.add(path);
             items.push({
@@ -1040,10 +1707,23 @@
                 path,
                 type: guessItemType(path, title),
                 completed,
+                hasSuccessIcon,
                 moduleId: "",
                 moduleTitle: "",
             });
         });
+
+        // If the sidebar renders green check icons at all, an item WITHOUT the icon is not done.
+        // And an item WITH the icon is definitively done.
+        if (items.some((item) => item.hasSuccessIcon)) {
+            items.forEach((item) => {
+                if (!item.hasSuccessIcon) {
+                    item.completed = false;
+                } else {
+                    item.completed = true;
+                }
+            });
+        }
 
         return items;
     }
@@ -1059,16 +1739,26 @@
         );
         const text = cleanText(node.textContent);
         const hasSuccessIcon = Boolean(
-            node.querySelector('[data-testid="learn-item-success-icon"]')
+            checkElementHasSuccessIcon(node) || (anchor && checkElementHasSuccessIcon(anchor))
         );
 
         const signalCompletion = inferSidebarCompletionSignals({
             ariaLabel,
             text,
             hasSuccessIcon,
+            passingThreshold: cachedPassingThreshold,
         });
         if (typeof signalCompletion === "boolean") {
             return signalCompletion;
+        }
+
+        // If the item text contains a failing grade (< threshold), strictly return false
+        const gradePercent = extractGradePercentage(`${ariaLabel} ${text}`);
+        if (gradePercent !== null) {
+            const dynamicThreshold = extractPassingThreshold(`${ariaLabel} ${text}`, cachedPassingThreshold);
+            if (gradePercent < dynamicThreshold) {
+                return false;
+            }
         }
 
         if (
@@ -1135,8 +1825,16 @@
             ? state.completedPaths
             : [];
 
+        const hasSidebarSuccessIcons = items.some((item) => item.hasSuccessIcon);
+
         completedPaths.forEach((path) => {
-            completionMap.set(path, true);
+            // If DOM on screen explicitly evaluated this item without a success icon, NEVER treat as complete!
+            if (completionMap.get(path) === false) {
+                return;
+            }
+            if (!hasSidebarSuccessIcons && completionMap.get(path) !== false) {
+                completionMap.set(path, true);
+            }
         });
 
         return completionMap;
@@ -1172,38 +1870,63 @@
     }
 
     function isQuizItem(item, currentPath) {
-        return item.type === "quiz" || /\/attempt$/.test(currentPath);
+        return (item && item.type === "quiz") ||
+            /\/(attempt|submit)$/i.test(currentPath) ||
+            (item && /\/(peer|quiz|exam|assignment-submission)\//i.test(item.path || ""));
     }
 
     function findAttemptPath(itemPath) {
         const currentPath = normalizePath(location.pathname);
-        if (/\/attempt$/.test(currentPath)) {
+        if (matchesItemPath(currentPath, itemPath) && /\/(attempt|submit)$/i.test(currentPath)) {
             return currentPath;
         }
 
-        const explicitAttemptLink = document.querySelector("a[href*='/attempt']");
+        const explicitAttemptLink = document.querySelector("a[href*='/attempt'], a[href*='/submit']");
         if (explicitAttemptLink && matchesItemPath(explicitAttemptLink.href, itemPath)) {
             return normalizePath(explicitAttemptLink.href);
         }
 
-        return `${normalizePath(itemPath)}/attempt`;
-    }
+        const cleanItem = normalizePath(itemPath).replace(/\/(attempt|view-feedback|instructions|feedback|submit|give-feedback|review)$/i, "");
+        if (/\/peer\//i.test(cleanItem)) {
+            return `${cleanItem}/submit`;
+        }
+        if (/\/(quiz|exam)\b/i.test(cleanItem)) {
+            return `${cleanItem}/attempt`;
+        }
 
-    function matchesItemPath(currentPath, itemPath) {
-        const normalizedCurrent = normalizePath(currentPath);
-        const normalizedItem = normalizePath(itemPath);
-        return normalizedCurrent === normalizedItem || normalizedCurrent === `${normalizedItem}/attempt`;
+        return null;
     }
 
     function navigateTo(path, mode = RUN_MODE_FULL) {
         const target = normalizePath(path);
-        if (target && target !== normalizePath(location.pathname)) {
-            logRunner("navigate", {
-                from: normalizePath(location.pathname),
-                to: target,
-            }, { mode });
-            window.location.assign(target);
+        const current = normalizePath(location.pathname);
+        if (!target || target === current) return;
+
+        const targetSubroute = target.match(/\/(instructions|attempt|view-feedback|feedback|submit|submission)\b/i);
+        const currentSubroute = current.match(/\/(instructions|attempt|view-feedback|feedback|submit|submission)\b/i);
+
+        // Prevent redundant page reloads if already on the target item cover page
+        if (matchesItemPath(current, target)) {
+            // If neither has a subroute, both are cover pages (e.g. /item/123 vs /item/123/title-slug)
+            if (!targetSubroute && !currentSubroute) {
+                return;
+            }
+            // If both have the same subroute, avoid reloading
+            if (targetSubroute && currentSubroute && targetSubroute[1].toLowerCase() === currentSubroute[1].toLowerCase()) {
+                return;
+            }
+            // If target is base item path (no subroute) and current is already on an active working subroute (submit or attempt),
+            // NEVER reload/navigate back to the cover page!
+            if (!targetSubroute && currentSubroute && /^(submit|submission|attempt)$/i.test(currentSubroute[1])) {
+                return;
+            }
         }
+
+        logRunner("navigate", {
+            from: current,
+            to: target,
+        }, { mode });
+        window.location.assign(target);
     }
 
     function deriveCourseSlug() {
@@ -1215,30 +1938,236 @@
         return (value || "").replace(/\s+/g, " ").trim();
     }
 
-    function findActionButton(predicate) {
+    // Text of the current item's main content only. The course outline sidebar contains
+    // other items' "Grade: 100%" and titles like "Congratulations", which must not be read
+    // as the current quiz result.
+    function getMainContentText() {
+        if (!document.body) return "";
+        try {
+            const clone = document.body.cloneNode(true);
+            const selectors = [
+                "nav",
+                "aside",
+                "header",
+                "footer",
+                "[role='navigation']",
+                "[role='complementary']",
+                "[data-testid*='sidebar' i]",
+                "[data-testid*='outline' i]",
+                "[class*='sidebar' i]",
+                "[class*='ItemNavigation' i]",
+                "[class*='course-outline' i]",
+                "[aria-label*='course outline' i]",
+                "[aria-label*='course material' i]",
+                "script",
+                "style",
+                "noscript",
+            ];
+            clone.querySelectorAll(selectors.join(",")).forEach((el) => {
+                // Never strip a wrapper that holds the main item content
+                if (el.querySelector("h1, input[type='radio'], input[type='checkbox'], textarea")) return;
+                el.remove();
+            });
+            return cleanText(clone.textContent);
+        } catch (e) {
+            return cleanText(document.body.textContent);
+        }
+    }
+
+    function findActionButton(predicate, searchRoot = null) {
+        const root = searchRoot || document;
         const buttons = Array.from(
-            document.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']")
+            root.querySelectorAll("button, [role='button'], a, input[type='button'], input[type='submit']")
         );
 
         return buttons.find((button) => {
+            if (!searchRoot && button.closest("header, nav, [role='navigation'], aside, [data-testid*='sidebar' i]")) {
+                return false;
+            }
             const label = getButtonLabel(button);
             return predicate(label);
         }) || null;
     }
 
     function findStartQuizButton() {
-        return (
-            document.querySelector('[data-testid="CoverPageActionButton"]') ||
-            findActionButton(isStartActionLabel)
+        const currentPath = normalizePath(location.pathname);
+        if (/\/(attempt|submit)$/i.test(currentPath)) {
+            return null;
+        }
+
+        const mainContent = document.querySelector("main, [role='main'], #rendered-content, #main, .rc-ItemPage, [class*='ItemPage' i]") || document.body;
+
+        // 1. Explicit cover page testids in main content
+        const explicitTestId = mainContent.querySelector(
+            '[data-testid="CoverPageActionButton"], [data-testid*="CoverPageAction" i], [data-testid*="cover-page-action" i], [data-testid*="resume-assignment" i], [data-testid*="start-assignment" i], [data-track-component*="start_assignment" i], [data-track-component*="resume_assignment" i]'
         );
+        if (explicitTestId && !isButtonDisabled(explicitTestId)) {
+            return explicitTestId;
+        }
+
+        // 2. Direct attempt link within current quiz/assignment path
+        const attemptLinks = Array.from(mainContent.querySelectorAll('a[href*="/attempt"]'));
+        for (const link of attemptLinks) {
+            if (!isButtonDisabled(link)) {
+                const label = getButtonLabel(link);
+                if (!/cancel|back|return/i.test(label)) {
+                    return link;
+                }
+            }
+        }
+
+        // 3. Find button or link in mainContent matching isStartActionLabel
+        const actionBtn = findActionButton(isStartActionLabel, mainContent);
+        if (actionBtn && !isButtonDisabled(actionBtn)) {
+            return actionBtn;
+        }
+
+        // 4. Fallback in mainContent: text containing start/resume assignment or quiz
+        const allCandidates = Array.from(
+            mainContent.querySelectorAll('button, a, [role="button"]')
+        );
+        for (const btn of allCandidates) {
+            if (isButtonDisabled(btn)) continue;
+            const text = cleanText(getButtonLabel(btn) || btn.textContent).toLowerCase();
+            if (
+                text.includes("start assignment") ||
+                text.includes("resume assignment") ||
+                text === "start quiz" ||
+                text === "resume quiz" ||
+                text === "resume" ||
+                text === "làm tiếp" ||
+                text === "bắt đầu"
+            ) {
+                return btn;
+            }
+        }
+
+        // 5. Global fallback if main content root didn't match
+        return findActionButton(isStartActionLabel);
+    }
+
+    function findStartAttemptModalConfirmButton() {
+        const dialogs = Array.from(
+            document.querySelectorAll(
+                '[role="dialog"], [aria-modal="true"], .cds-modal, [class*="dialog" i], [class*="modal" i], [data-testid*="dialog" i], [data-testid*="modal" i]'
+            )
+        );
+
+        for (const dialog of dialogs) {
+            if (dialog.offsetParent === null && !dialog.getClientRects().length) {
+                continue;
+            }
+
+            const text = cleanText(dialog.textContent).toLowerCase();
+            if (/start (new )?attempt|timed|time limit|attempt limit|ready to start|time to submit|resume|in progress/i.test(text)) {
+                const buttons = Array.from(dialog.querySelectorAll('button, [role="button"], a, input[type="button"]'));
+                const confirmBtn = buttons.find((btn) => {
+                    const label = getButtonLabel(btn).toLowerCase();
+                    return /^(continue|start|start attempt|begin|resume)\b/i.test(label) && !/cancel|back|return|hủy/i.test(label);
+                });
+                if (confirmBtn && !isButtonDisabled(confirmBtn)) {
+                    return confirmBtn;
+                }
+
+                const primaryBtn = buttons.find((btn) => {
+                    const label = getButtonLabel(btn).toLowerCase();
+                    const isPrimary = btn.classList.contains("cds-button--primary") || /primary/i.test(btn.className);
+                    return isPrimary && !/cancel|back|return|hủy/i.test(label);
+                });
+                if (primaryBtn && !isButtonDisabled(primaryBtn)) {
+                    return primaryBtn;
+                }
+            }
+        }
+
+        for (const dialog of dialogs) {
+            if (dialog.offsetParent === null && !dialog.getClientRects().length) {
+                continue;
+            }
+            const buttons = Array.from(dialog.querySelectorAll('button, [role="button"], a'));
+            const continueBtn = buttons.find((btn) => {
+                const label = getButtonLabel(btn).toLowerCase();
+                return /^(continue|resume|start)$/i.test(label) && !isButtonDisabled(btn);
+            });
+            if (continueBtn) {
+                return continueBtn;
+            }
+        }
+
+        return null;
+    }
+
+    function findClickableElementByText(targetText, targetSelector = "") {
+        if (!targetText && !targetSelector) return null;
+
+        if (targetSelector) {
+            try {
+                const elem = document.querySelector(targetSelector);
+                if (elem && !isButtonDisabled(elem) && !isHiddenControl(elem)) {
+                    return elem;
+                }
+            } catch (_) {}
+        }
+
+        if (!targetText) return null;
+
+        const isMatch = (btn) => {
+            if (isButtonDisabled(btn) || isHiddenControl(btn)) return false;
+            const text = getButtonLabel(btn) || btn.textContent || "";
+            if (CourseRunnerHelpers && CourseRunnerHelpers.isMatchingClickableText) {
+                return CourseRunnerHelpers.isMatchingClickableText(text, targetText);
+            }
+            return text.toLowerCase().includes(targetText.toLowerCase());
+        };
+
+        // 1. Look in open dialogs / modals first
+        const dialogs = Array.from(
+            document.querySelectorAll(
+                '[role="dialog"], [aria-modal="true"], .cds-modal, [class*="dialog" i], [class*="modal" i]'
+            )
+        );
+        for (const dialog of dialogs) {
+            if (dialog.offsetParent === null && !dialog.getClientRects().length) continue;
+            const candidates = Array.from(
+                dialog.querySelectorAll('button, [role="button"], a, input[type="button"], input[type="submit"]')
+            );
+            for (const btn of candidates) {
+                if (isMatch(btn)) return btn;
+            }
+        }
+
+        // 2. Global search
+        const globalCandidates = Array.from(
+            document.querySelectorAll(
+                'button, [role="button"], a.cds-button, input[type="button"], input[type="submit"], [role="link"], a'
+            )
+        );
+        for (const btn of globalCandidates) {
+            if (isMatch(btn)) return btn;
+        }
+
+        return null;
     }
 
     function findHonorCodeCheckbox() {
-        return (
+        const standard = (
             document.querySelector('[data-testid="agreement-standalone-checkbox"] input[type="checkbox"]') ||
             document.querySelector('[data-testid="agreement-checkbox"] input[type="checkbox"]') ||
             document.querySelector("#agreement-checkbox-base")
         );
+        if (standard) {
+            return standard;
+        }
+
+        const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+        return checkboxes.find((input) => {
+            const label = input.closest && input.closest("label");
+            const container = input.closest && input.closest(".rc-HonorCodeAgreement, [data-testid*='agreement' i], [class*='HonorCode' i], .rc-MySubmission, #submission-form");
+            const text = cleanText(
+                `${label ? label.textContent : ""} ${container ? container.textContent : ""}`
+            ).toLowerCase();
+            return /understand|agree|honor code|submitting work|cam kết|đồng ý/.test(text);
+        }) || null;
     }
 
     function findAppAgreementCheckbox() {
@@ -1271,18 +2200,56 @@
         return /^launch app\b/.test(value) || /^launch\b/.test(value);
     }
 
+    function findSubmitButton() {
+        const mainContent = document.querySelector("main, [role='main'], #rendered-content, #main, .rc-ItemPage, [class*='ItemPage' i], form") || document;
+        const submitBtn = findActionButton(isSubmitActionLabel, mainContent);
+        if (submitBtn && !isButtonDisabled(submitBtn)) {
+            return submitBtn;
+        }
+
+        const testIdBtn = mainContent.querySelector('button[data-testid*="submit" i], button[aria-label*="submit" i], button[type="submit"]');
+        if (testIdBtn && !isButtonDisabled(testIdBtn)) {
+            return testIdBtn;
+        }
+
+        return findActionButton(isSubmitActionLabel);
+    }
+
     function findConfirmSubmitButton() {
-        return (
+        const explicit = (
             document.querySelector('[data-testid="dialog-submit-button"]') ||
             document.querySelector('[data-testid="SubmitDialog__controls"] button')
         );
+        if (explicit && !isButtonDisabled(explicit)) return explicit;
+
+        const dialog = document.querySelector('[role="dialog"], [aria-modal="true"], .cds-modal, [class*="dialog" i], [class*="modal" i]');
+        if (dialog) {
+            const btn = findActionButton(isSubmitActionLabel, dialog) ||
+                dialog.querySelector('button[type="submit"], [data-testid*="submit" i], button.cds-button--primary');
+            if (btn && !isButtonDisabled(btn)) return btn;
+        }
+        return explicit || null;
     }
 
     function findNextItemButton() {
-        return (
-            document.querySelector('[data-testid="TopBannerCTAButton"]') ||
-            findActionButton(isContinueActionLabel)
+        const topBannerCTA = document.querySelector(
+            '[data-testid="TopBannerCTAButton"], [data-testid*="next" i], [data-testid*="Next" i], [data-track-component="next_item_button"], a[aria-label*="Next item" i], button[aria-label*="Next item" i]'
         );
+        if (topBannerCTA && !isButtonDisabled(topBannerCTA)) {
+            return topBannerCTA;
+        }
+
+        const buttons = Array.from(
+            document.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']")
+        );
+
+        return buttons.find((button) => {
+            if (button.closest && button.closest('[role="dialog"], [aria-modal="true"], .cds-modal, [class*="dialog" i], [class*="modal" i]')) {
+                return false;
+            }
+            const label = getButtonLabel(button);
+            return isContinueActionLabel(label);
+        }) || null;
     }
 
     function clickFirstMatchingButton(predicate) {
@@ -1296,26 +2263,115 @@
     }
 
     function getButtonLabel(button) {
+        if (!button) {
+            return "";
+        }
         return cleanText(
             button.innerText ||
             button.textContent ||
             button.value ||
-            button.getAttribute("aria-label") ||
-            button.getAttribute("title")
+            (typeof button.getAttribute === "function"
+                ? (button.getAttribute("aria-label") || button.getAttribute("title"))
+                : "")
         );
     }
 
     function isButtonDisabled(button) {
-        return Boolean(
+        if (!button) {
+            return true;
+        }
+        if (
             button.disabled ||
-            button.getAttribute("aria-disabled") === "true" ||
-            button.classList.contains("disabled")
+            button.hasAttribute("disabled") ||
+            (typeof button.getAttribute === "function" && (
+                button.getAttribute("aria-disabled") === "true" ||
+                button.getAttribute("data-disabled") === "true"
+            ))
+        ) {
+            return true;
+        }
+        if (button.classList) {
+            for (const cls of button.classList) {
+                if (/disabled/i.test(cls)) {
+                    return true;
+                }
+            }
+        }
+        try {
+            const style = window.getComputedStyle(button);
+            if (style && (style.pointerEvents === "none" || style.cursor === "not-allowed")) {
+                return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function findFeedbackBackButton() {
+        const direct = document.querySelector(
+            '[data-testid*="back-button" i], [data-testid*="backButton" i], [data-testid*="go-back" i], ' +
+            'button[aria-label*="back" i], a[aria-label*="back" i], ' +
+            'button[aria-label*="quay lại" i], a[aria-label*="quay lại" i], ' +
+            'button[aria-label*="return" i], a[aria-label*="return" i]'
         );
+        if (direct && !isButtonDisabled(direct)) {
+            return direct;
+        }
+
+        const actionBtn = findActionButton((label) => {
+            const clean = cleanText(label).toLowerCase();
+            return /^(back|go back|back to assignment|return to assignment|back to quiz|quay lại|trở về|quay lại bài tập)$/i.test(clean) ||
+                   /^(back|quay lại)\b/i.test(clean);
+        });
+        if (actionBtn && !isButtonDisabled(actionBtn)) {
+            return actionBtn;
+        }
+
+        const svgArrows = Array.from(document.querySelectorAll(
+            'svg[data-testid*="arrow-back" i], svg[data-testid*="ArrowBack" i], svg[data-testid*="arrow-left" i], svg[data-testid*="ArrowLeft" i], svg[data-testid*="chevron-left" i]'
+        ));
+        for (const svg of svgArrows) {
+            const btn = svg.closest('button, a, [role="button"]');
+            if (btn && !isButtonDisabled(btn)) {
+                return btn;
+            }
+        }
+
+        return null;
     }
 
     function safeClick(button) {
-        button.scrollIntoView({ block: "center", inline: "center" });
-        button.click();
+        if (!button) return;
+        if (typeof button.scrollIntoView === "function") {
+            try {
+                button.scrollIntoView({ block: "center", inline: "center" });
+            } catch (_) {}
+        }
+        if (typeof button.focus === "function") {
+            try {
+                button.focus();
+            } catch (_) {}
+        }
+        try {
+            const eventOpts = { bubbles: true, cancelable: true, view: window, pointerType: "mouse", isPrimary: true, button: 0 };
+            if (typeof PointerEvent === "function") {
+                button.dispatchEvent(new PointerEvent("pointerdown", eventOpts));
+                button.dispatchEvent(new PointerEvent("pointerup", eventOpts));
+            }
+            button.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, button: 0 }));
+            button.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, button: 0 }));
+            button.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window, button: 0 }));
+        } catch (_) {}
+        if (typeof button.click === "function") {
+            try {
+                button.click();
+            } catch (_) {}
+        }
+        const anchor = button.matches && button.matches("a[href]") ? button : (button.closest && button.closest("a[href]"));
+        if (anchor && anchor !== button && typeof anchor.click === "function") {
+            try {
+                anchor.click();
+            } catch (_) {}
+        }
     }
 
     function clickCheckbox(input) {
@@ -1328,10 +2384,10 @@
         }
     }
 
-    function activateNextItem(button) {
+    function activateNextItem(button, mode = RUN_MODE_FULL) {
         const href = button.getAttribute && button.getAttribute("href");
         if (href) {
-            navigateTo(href, RUN_MODE_QUIZ);
+            navigateTo(href, mode);
             return;
         }
 
@@ -1344,8 +2400,112 @@
         });
     }
 
+    function captureCurrentTabScreenshot() {
+        return new Promise((resolve) => {
+            if (typeof chrome === "undefined" || !chrome.runtime || !chrome.runtime.sendMessage) {
+                resolve(null);
+                return;
+            }
+
+            try {
+                chrome.runtime.sendMessage(
+                    { type: "captureVisibleTab", format: "jpeg", quality: 80 },
+                    (response) => {
+                        if (chrome.runtime.lastError || !response || !response.ok || !response.dataUrl) {
+                            resolve(null);
+                        } else {
+                            resolve(response.dataUrl);
+                        }
+                    }
+                );
+            } catch (err) {
+                resolve(null);
+            }
+        });
+    }
+
+    async function attemptVisionNavigationFallback(currentItem, mode, triggerReason = "") {
+        logRunner("quiz_vision_analysis_start", {
+            ...summarizeItem(currentItem),
+            triggerReason,
+        }, { mode });
+
+        const screenshotUrl = await captureCurrentTabScreenshot();
+        if (!screenshotUrl) {
+            logRunnerWarn("quiz_vision_no_screenshot", {
+                ...summarizeItem(currentItem),
+                message: "Could not capture tab screenshot for vision fallback.",
+            });
+            return false;
+        }
+
+        const AIClass = window.GeminiAI || window.GroqAI || window.ChatGPTAI;
+        if (!AIClass) {
+            return false;
+        }
+
+        const ai = new AIClass();
+        let decision = null;
+        try {
+            decision = await ai.decideActionFromScreenshot(screenshotUrl, {
+                url: location.href,
+                title: document.title,
+                status: triggerReason,
+            });
+        } catch (err) {
+            logRunnerWarn("quiz_vision_error", {
+                ...summarizeItem(currentItem),
+                error: err && err.message,
+            });
+            return false;
+        }
+
+        const normalized = CourseRunnerHelpers && CourseRunnerHelpers.normalizeVisionDecision
+            ? CourseRunnerHelpers.normalizeVisionDecision(decision)
+            : decision;
+
+        logRunner("quiz_vision_decision_received", {
+            ...summarizeItem(currentItem),
+            action: normalized.action,
+            targetText: normalized.targetText,
+            reason: normalized.reason,
+        }, { mode });
+
+        if (normalized.action === "click" && normalized.targetText) {
+            const element = findClickableElementByText(normalized.targetText, normalized.targetSelector);
+            if (element) {
+                logRunner("quiz_vision_action_clicked", {
+                    ...summarizeItem(currentItem),
+                    targetText: normalized.targetText,
+                }, { mode });
+                const anchor = (element.getAttribute && element.getAttribute("href"))
+                    ? element
+                    : (element.closest ? element.closest("a[href]") : null);
+                const href = anchor && anchor.getAttribute && anchor.getAttribute("href");
+                safeClick(element);
+                if (href && !href.startsWith("#") && !href.startsWith("javascript:")) {
+                    await delay(1000);
+                    if (normalizePath(location.pathname) === normalizePath(currentItem.path)) {
+                        navigateTo(href, mode);
+                    }
+                }
+                return true;
+            } else {
+                logRunnerWarn("quiz_vision_action_failed", {
+                    ...summarizeItem(currentItem),
+                    targetText: normalized.targetText,
+                });
+            }
+        }
+
+        return false;
+    }
+
     function hasQuizResultSettled(submitConfirmedAt, quizResultSettleMs = QUIZ_RESULT_SETTLE_MS) {
-        return submitConfirmedAt > 0 && Date.now() - submitConfirmedAt >= quizResultSettleMs;
+        if (!submitConfirmedAt) {
+            return true;
+        }
+        return Date.now() - submitConfirmedAt >= quizResultSettleMs;
     }
 
     function getQuizAnswerProgress() {
@@ -1432,10 +2592,17 @@
     }
 
     function isHonorCodeControl(control) {
+        if (!control) return false;
+
+        const honorCheckbox = findHonorCodeCheckbox();
+        if (honorCheckbox && (control === honorCheckbox || control.id === honorCheckbox.id)) {
+            return true;
+        }
+
         const closestAgreement =
             control.closest &&
             control.closest(
-                '[data-testid*="agreement" i], [id*="agreement" i], [class*="agreement" i]'
+                '[data-testid*="agreement-standalone-checkbox" i], [data-testid*="agreement-checkbox" i], #agreement-checkbox-base, .rc-HonorCodeAgreement'
             );
         if (closestAgreement) {
             return true;
@@ -1450,20 +2617,1746 @@
             ].join(" ")
         ).toLowerCase();
 
-        return /(honor|pledge|agreement|agree|understand)/.test(value);
+        return /(?:coursera honor code|understand and agree|honor code policy|agree to use this app responsibly)/i.test(value);
     }
 
     function isHiddenControl(control) {
+        if (!control) return true;
         if (control.type === "hidden") {
             return true;
+        }
+
+        // If inside an option container or label or choice item, it's NOT a hidden control (it's the backing input)
+        if (control.closest && control.closest('[role="radio"], [role="checkbox"], label, [class*="option" i], [data-testid*="option" i], [class*="choice" i]')) {
+            return false;
         }
 
         if (control.offsetParent !== null) {
             return false;
         }
 
-        const style = window.getComputedStyle(control);
-        return style.display === "none" || style.visibility === "hidden";
+        try {
+            const style = window.getComputedStyle(control);
+            return style.display === "none" || style.visibility === "hidden";
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function selectOptionInput(input, desiredState = true) {
+        if (!input) return;
+
+        try {
+            const scrollTarget = (input.closest && input.closest('label, [role="radio"], [role="checkbox"], [data-testid*="option" i], li, div[class*="option" i]')) || input;
+            if (typeof scrollTarget.scrollIntoView === "function") {
+                scrollTarget.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+            }
+        } catch (_) {}
+
+        // If already in desired state, do nothing
+        if (input.checked === desiredState || input.getAttribute("aria-checked") === String(desiredState)) {
+            return;
+        }
+
+        try {
+            input.focus();
+        } catch (_) {}
+
+        // Handle ARIA role="radio" / role="checkbox"
+        const role = input.getAttribute && input.getAttribute("role");
+        if (role === "radio" || role === "checkbox") {
+            if (typeof input.click === "function") {
+                input.click();
+            }
+            input.setAttribute("aria-checked", desiredState ? "true" : "false");
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            return;
+        }
+
+        // For standard checkboxes and radios, standard native click is primary
+        if (typeof input.click === "function") {
+            input.click();
+        }
+
+        // If native click did not reach desiredState, also try clicking enclosing label or parent
+        if (input.checked !== desiredState) {
+            const label = input.closest && input.closest("label");
+            if (label && label !== input && typeof label.click === "function") {
+                try { label.click(); } catch (_) {}
+            }
+        }
+
+        // Programmatic fallback
+        if (input.checked !== desiredState) {
+            const checkedSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                "checked"
+            )?.set;
+
+            if (checkedSetter) {
+                checkedSetter.call(input, desiredState);
+            } else {
+                input.checked = desiredState;
+            }
+
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+    }
+
+    async function fillTextInput(input, text) {
+        if (!input || !text) return;
+
+        let targetEl = input;
+        if (!targetEl.isContentEditable && targetEl.querySelector) {
+            const innerEditable = targetEl.querySelector('div[contenteditable="true"], textarea, input:not([type="hidden"])');
+            if (innerEditable) targetEl = innerEditable;
+        }
+
+        // Scroll element into view so Draft.js and browser selection coordinates align
+        try {
+            targetEl.scrollIntoView({ block: "center", behavior: "instant" });
+        } catch (_) {}
+
+        // Dispatch pointer and mouse events to activate editor container
+        try {
+            targetEl.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+            targetEl.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+            targetEl.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+        } catch (_) {}
+
+        try {
+            targetEl.focus();
+        } catch (_) {}
+
+        const isContentEditable = targetEl.isContentEditable ||
+            targetEl.getAttribute("contenteditable") === "true" ||
+            targetEl.getAttribute("role") === "textbox";
+
+        if (isContentEditable) {
+            await delay(100);
+
+            try {
+                const selection = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(targetEl);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            } catch (_) {}
+
+            let ok = false;
+            try {
+                ok = document.execCommand("insertText", false, text);
+            } catch (_) {}
+
+            const curLen = cleanText(targetEl.innerText || targetEl.textContent || "").length;
+            if (!ok || curLen < Math.min(20, text.length)) {
+                try {
+                    const dt = new DataTransfer();
+                    dt.setData("text/plain", text);
+                    const pasteEvt = new ClipboardEvent("paste", {
+                        bubbles: true,
+                        cancelable: true,
+                        clipboardData: dt,
+                    });
+                    try {
+                        Object.defineProperty(pasteEvt, "clipboardData", { value: dt, writable: false });
+                    } catch (_) {}
+                    targetEl.dispatchEvent(pasteEvt);
+                } catch (_) {}
+            }
+
+            try {
+                targetEl.dispatchEvent(new InputEvent("beforeinput", {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: "insertText",
+                    data: text,
+                }));
+            } catch (_) {}
+            try {
+                targetEl.dispatchEvent(new InputEvent("input", {
+                    bubbles: true,
+                    inputType: "insertText",
+                    data: text,
+                }));
+            } catch (_) {}
+            targetEl.dispatchEvent(new Event("input", { bubbles: true }));
+            targetEl.dispatchEvent(new Event("change", { bubbles: true }));
+
+            const postLen = cleanText(targetEl.innerText || targetEl.textContent || "").length;
+            if (postLen < Math.min(20, text.length)) {
+                try {
+                    targetEl.innerText = text;
+                    targetEl.dispatchEvent(new Event("input", { bubbles: true }));
+                    targetEl.dispatchEvent(new Event("change", { bubbles: true }));
+                } catch (_) {}
+            }
+
+            // Allow Draft.js / React state to commit
+            await delay(250);
+
+            try {
+                targetEl.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+            } catch (_) {}
+            try {
+                targetEl.blur();
+            } catch (_) {}
+            await delay(100);
+            return;
+        }
+
+        const proto = (targetEl instanceof HTMLTextAreaElement)
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+
+        const valueSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        if (valueSetter) {
+            valueSetter.call(targetEl, text);
+        } else {
+            targetEl.value = text;
+        }
+
+        try {
+            targetEl.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+        } catch (_) {}
+        targetEl.dispatchEvent(new Event("input", { bubbles: true }));
+        targetEl.dispatchEvent(new Event("change", { bubbles: true }));
+        try {
+            targetEl.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+            targetEl.blur();
+        } catch (_) {}
+        await delay(100);
+    }
+
+    function findCommonParent(elements) {
+        if (!elements || !elements.length) return null;
+        let parent = elements[0].parentElement;
+        while (parent && parent !== document.body) {
+            if (elements.every((el) => parent.contains(el))) {
+                return parent;
+            }
+            parent = parent.parentElement;
+        }
+        return elements[0].parentElement;
+    }
+
+    function extractOptionText(input) {
+        if (!input) return "";
+
+        function cleanOptionElementText(el) {
+            if (!el) return "";
+            try {
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll(
+                    '.rc-OptionFeedback, .rc-QuestionFeedback, [class*="Feedback" i], [class*="feedback" i], [role="alert"], [aria-live], svg, button'
+                ).forEach((e) => e.remove());
+                return cleanText(clone.textContent);
+            } catch (_) {
+                return cleanText(el.textContent);
+            }
+        }
+
+        if (input.labels && input.labels.length > 0) {
+            const text = cleanOptionElementText(input.labels[0]);
+            if (text) return text;
+        }
+
+        const label = input.closest && input.closest("label");
+        if (label) {
+            const text = cleanOptionElementText(label);
+            if (text) return text;
+        }
+
+        let sibling = input.nextElementSibling;
+        while (sibling) {
+            if (!/feedback|alert/i.test(sibling.className || "")) {
+                const text = cleanOptionElementText(sibling);
+                if (text) return text;
+            }
+            sibling = sibling.nextElementSibling;
+        }
+
+        if (input.parentElement) {
+            const text = cleanOptionElementText(input.parentElement);
+            if (text) return text;
+        }
+
+        return input.value || "";
+    }
+
+    function extractQuestionText(container, inputs = []) {
+        if (!container) return "";
+
+        const promptEl = container.querySelector(
+            '[data-testid*="prompt" i], [data-testid*="question-text" i], [class*="prompt" i], [class*="Prompt" i], legend, h1, h2, h3, h4, h5'
+        );
+        if (promptEl) {
+            const text = cleanText(promptEl.textContent);
+            if (text && text.length > 5) {
+                return text;
+            }
+        }
+
+        try {
+            const clone = container.cloneNode(true);
+            clone.querySelectorAll(
+                'input, textarea, select, label, [role="radio"], [role="checkbox"], script, style, svg'
+            ).forEach((el) => el.remove());
+            const remainingText = cleanText(clone.textContent);
+            if (remainingText && remainingText.length > 5) {
+                return remainingText;
+            }
+        } catch (_) {}
+
+        return cleanText(container.textContent).slice(0, 300);
+    }
+
+    function extractPeerPromptText(input) {
+        if (!input) return "";
+        const placeholder = input.getAttribute("placeholder") || "";
+        if (/title/i.test(placeholder)) {
+            return "Project Title";
+        }
+
+        let cur = input;
+        for (let i = 0; i < 5 && cur; i++) {
+            let prev = cur.previousElementSibling;
+            while (prev) {
+                const text = cleanText(prev.textContent);
+                if (text && text.length > 5 && !/toolbar|format|bold|italic|underline/i.test(text)) {
+                    return text;
+                }
+                prev = prev.previousElementSibling;
+            }
+            cur = cur.parentElement;
+        }
+
+        const container = input.closest('fieldset, [class*="part" i], [class*="item" i], [class*="question" i], [class*="prompt" i], form > div, section') || input.parentElement?.parentElement;
+        if (container) {
+            const heading = container.querySelector('h1, h2, h3, h4, h5, h6, legend, label, [class*="prompt" i], [class*="title" i], [class*="description" i]');
+            if (heading) {
+                const headingText = cleanText(heading.textContent);
+                if (headingText && headingText.length > 5 && !/toolbar|format/i.test(headingText)) {
+                    return headingText;
+                }
+            }
+        }
+        return "";
+    }
+
+    function generateFallbackTextAnswer(prompt, currentTitle, isTitle = false) {
+        if (isTitle) {
+            const clean = cleanText(currentTitle || "").replace(/Practice Peer-graded Assignment|Peer-graded Assignment|Assignment/gi, "").trim();
+            return clean ? `${clean}: Strategic Analysis & Execution Plan` : "Data Science Business Project: Strategic Analysis & Execution Plan";
+        }
+
+        const cleanPrompt = cleanText(prompt || "").replace(/Question \d+/i, "").trim();
+        return `In addressing ${cleanPrompt || "this assignment requirement"}, the strategic solution is designed around rigorous analytical methodology and clear organizational alignment. First, we establish measurable performance metrics that tie directly into business objectives, ensuring verifiable value creation at every milestone. Second, data architectures are established with robust governance safeguards, end-to-end data pipeline integrity, and proactive risk mitigation against algorithmic bias or data leakage. Third, the operational workflow employs iterative validation cycles with cross-functional stakeholder reviews to refine models based on empirical results. This comprehensive structure guarantees sustained operational reliability, stakeholder transparency, and high practical return on investment.`;
+    }
+
+    function findQuestionContainer(input) {
+        if (!input) return null;
+
+        // 1. Look for known Coursera question block classes/testids
+        const questionBlock = input.closest && input.closest(
+            '.rc-FormPartsQuestion, [data-testid*="question" i], [data-testid*="Question" i], [class*="FormPartsQuestion" i], [class*="QuestionPart" i], [class*="quiz-question" i]'
+        );
+        if (questionBlock && questionBlock.tagName !== "FORM" && questionBlock.tagName !== "BODY") {
+            return questionBlock;
+        }
+
+        // 2. Climb looking for prompt element or question number with points
+        let node = input.parentElement;
+        let candidate = null;
+        while (node && node.tagName !== "FORM" && node.tagName !== "BODY") {
+            const text = cleanText(node.textContent);
+            const hasPrompt = Boolean(node.querySelector && node.querySelector(
+                '[data-testid*="prompt" i], [data-testid*="question-text" i], [class*="prompt" i], [class*="Prompt" i], legend, h1, h2, h3, h4, h5'
+            ));
+            const hasQuestionNum = /(?:^|\s)(?:\d+[\.\)]|Question\s*\d+)/i.test(text);
+            const hasPoints = /\b\d+\s*points?\b/i.test(text);
+
+            if (hasPrompt || (hasQuestionNum && hasPoints)) {
+                candidate = node;
+                const parent = node.parentElement;
+                if (parent) {
+                    const parentText = cleanText(parent.textContent);
+                    const qCount = (parentText.match(/(?:^|\s)(?:\d+[\.\)]|Question\s*\d+)/gi) || []).length;
+                    if (qCount > 1) {
+                        return node;
+                    }
+                }
+            }
+            node = node.parentElement;
+        }
+
+        if (candidate) return candidate;
+
+        // 3. Fallback: climb until container has multiple option inputs
+        let fallback = input.parentElement;
+        while (fallback && fallback.tagName !== "FORM" && fallback.tagName !== "BODY") {
+            const inputsInside = fallback.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+            if (inputsInside.length > 1) {
+                return fallback;
+            }
+            fallback = fallback.parentElement;
+        }
+
+        return (input.parentElement && input.parentElement.parentElement) || input.parentElement;
+    }
+
+    async function ensureAllQuizContentScrolledAndLoaded(mode = RUN_MODE_QUIZ) {
+        const scrollContainers = new Set();
+        if (document.scrollingElement) scrollContainers.add(document.scrollingElement);
+        if (document.body) scrollContainers.add(document.body);
+        if (document.documentElement) scrollContainers.add(document.documentElement);
+
+        const candidates = document.querySelectorAll(
+            'main, [role="main"], [class*="Attempt" i], [class*="content" i], [class*="layout" i], ' +
+            '[class*="scroll" i], [class*="quiz" i], [class*="question" i], form, section, article, div'
+        );
+
+        candidates.forEach((el) => {
+            try {
+                if (el.scrollHeight > el.clientHeight + 40) {
+                    const style = window.getComputedStyle(el);
+                    const overflowY = (style.overflowY || style.overflow || "").toLowerCase();
+                    if (/auto|scroll|overlay/.test(overflowY)) {
+                        scrollContainers.add(el);
+                    }
+                }
+            } catch (_) {}
+        });
+
+        // 1. Unlock artificial scroll barriers/traps
+        scrollContainers.forEach((el) => {
+            try {
+                if (el instanceof HTMLElement) {
+                    const style = window.getComputedStyle(el);
+                    if (style.overflowY === "hidden" && el.scrollHeight > el.clientHeight + 30) {
+                        el.style.overflowY = "auto";
+                    }
+                }
+            } catch (_) {}
+        });
+
+        // 2. Perform progressive scroll pass through each container
+        let anyScrolled = false;
+        for (const container of scrollContainers) {
+            try {
+                const maxScroll = container === window ? (document.documentElement.scrollHeight || document.body.scrollHeight) : container.scrollHeight;
+                const clientH = container === window ? window.innerHeight : container.clientHeight;
+                if (!maxScroll || maxScroll <= clientH + 30) continue;
+
+                anyScrolled = true;
+                const step = Math.max(250, Math.floor(clientH * 0.7));
+
+                for (let pos = 0; pos <= maxScroll; pos += step) {
+                    if (container === window) {
+                        window.scrollTo(0, pos);
+                    } else {
+                        container.scrollTop = pos;
+                    }
+                    container.dispatchEvent(new Event("scroll", { bubbles: true }));
+                    await delay(50);
+                }
+
+                if (container === window) {
+                    window.scrollTo(0, maxScroll);
+                } else {
+                    container.scrollTop = maxScroll;
+                }
+                container.dispatchEvent(new Event("scroll", { bubbles: true }));
+                await delay(80);
+
+                if (container === window) {
+                    window.scrollTo(0, 0);
+                } else {
+                    container.scrollTop = 0;
+                }
+                container.dispatchEvent(new Event("scroll", { bubbles: true }));
+                await delay(50);
+            } catch (_) {}
+        }
+
+        if (anyScrolled) {
+            logRunner("quiz_scroll_range_unlocked", {
+                containerCount: scrollContainers.size,
+            }, { mode });
+        }
+
+        await delay(150);
+    }
+
+    function extractAssignmentScenarioContext() {
+        const scenarioElements = Array.from(document.querySelectorAll(
+            '[data-testid*="instruction" i], [class*="instruction" i], [class*="Instruction" i], ' +
+            '[class*="scenario" i], [class*="Scenario" i], [class*="reading" i], [class*="Reading" i], ' +
+            '.rc-AssignmentInstructions, [class*="AssetContent" i], [class*="asset-content" i], ' +
+            '[data-testid*="asset-content" i], [class*="ItemContent" i], [class*="item-content" i], ' +
+            '[class*="Directions" i], [class*="directions" i], [class*="PromptBody" i], ' +
+            '[data-testid*="assignment-prompt" i], [class*="assignment-prompt" i]'
+        ));
+
+        for (const el of scenarioElements) {
+            if (el.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) {
+                continue;
+            }
+            const text = cleanText(el.textContent);
+            if (text && text.length > 40) {
+                return text.slice(0, 3000);
+            }
+        }
+
+        const firstQ = document.querySelector(
+            '.rc-FormPartsQuestion, [data-testid*="question" i], [class*="FormPartsQuestion" i], [class*="quiz-question" i], fieldset[class*="question" i]'
+        );
+        if (firstQ && firstQ.parentElement) {
+            let prev = firstQ.previousElementSibling;
+            const textParts = [];
+            while (prev) {
+                if (!prev.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]')) {
+                    const t = cleanText(prev.textContent);
+                    if (t && t.length > 20) {
+                        textParts.unshift(t);
+                    }
+                }
+                prev = prev.previousElementSibling;
+            }
+            if (textParts.length) {
+                return textParts.join("\n\n").slice(0, 3000);
+            }
+        }
+
+        return "";
+    }
+
+    function extractQuizQuestionsFromDom() {
+        const questions = [];
+        const seenInputs = new Set();
+        const containerMap = new Map();
+
+        // 1. Collect all radio and checkbox inputs (native inputs + ARIA roles)
+        const allChoiceInputs = Array.from(
+            document.querySelectorAll(
+                'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'
+            )
+        ).filter((input) => {
+            if (isHiddenControl(input) || isHonorCodeControl(input)) return false;
+            return true;
+        });
+
+        // Group inputs by question container
+        allChoiceInputs.forEach((input) => {
+            const container = findQuestionContainer(input);
+            if (!container) return;
+
+            if (!containerMap.has(container)) {
+                containerMap.set(container, []);
+            }
+            containerMap.get(container).push(input);
+        });
+
+        // Convert each question container into a structured question object
+        containerMap.forEach((inputs, container) => {
+            inputs.forEach((inp) => seenInputs.add(inp));
+
+            const hasCheckbox = inputs.some((inp) => inp.type === "checkbox" || inp.getAttribute("role") === "checkbox");
+            const type = hasCheckbox ? "multi_select" : "single_choice";
+            const questionText = extractQuestionText(container, inputs);
+
+            const options = inputs.map((input, idx) => ({
+                index: idx,
+                input,
+                text: extractOptionText(input),
+                value: input.value || input.getAttribute("data-value") || "",
+            }));
+
+            // Deduplicate inputs if any were queried twice
+            const uniqueOptions = [];
+            const seenOptionInputs = new Set();
+            options.forEach((opt) => {
+                if (!seenOptionInputs.has(opt.input)) {
+                    seenOptionInputs.add(opt.input);
+                    uniqueOptions.push(opt);
+                }
+            });
+
+            questions.push({
+                id: (container.id || `q_${questions.length}`),
+                type,
+                question: questionText || `Question (${questions.length + 1})`,
+                options: uniqueOptions.map((o) => o.text),
+                optionElements: uniqueOptions,
+                container,
+            });
+        });
+
+        // 2. Text areas / short answer inputs / rich-text fields
+        const textareas = Array.from(
+            document.querySelectorAll(
+                'textarea, input:not([type]), input[type="text"], div[contenteditable="true"], div[role="textbox"]'
+            )
+        ).filter((input) => {
+            if (seenInputs.has(input) || isHiddenControl(input)) return false;
+            const type = (input.type || "").toLowerCase();
+            if (/^(radio|checkbox|hidden|submit|button|image|reset|file)$/i.test(type)) return false;
+            const name = (input.name || input.id || input.className || "").toLowerCase();
+            if (/search|filter|token|auth|query/i.test(name)) return false;
+
+            // Exclude wrapper elements that contain an inner editable element (textarea, input, contenteditable)
+            if (input.querySelector('div[contenteditable="true"], textarea, input:not([type="hidden"])')) {
+                return false;
+            }
+            // If it's a div with role="textbox" but is NOT contenteditable and has no contenteditable attribute, skip it
+            if (input.tagName === "DIV" && !input.isContentEditable && input.getAttribute("contenteditable") !== "true") {
+                return false;
+            }
+            return true;
+        });
+
+        textareas.forEach((input, idx) => {
+            seenInputs.add(input);
+            const container = findQuestionContainer(input) || input.parentElement;
+            const isTitle = (input.placeholder && /title/i.test(input.placeholder)) ||
+                            (input.name && /title/i.test(input.name)) ||
+                            (input.id && /title/i.test(input.id)) ||
+                            Boolean(input.getAttribute("aria-label") && /title/i.test(input.getAttribute("aria-label"))) ||
+                            Boolean(container && /title/i.test(container.querySelector('label, [class*="label" i]')?.textContent || ""));
+            const questionText = isTitle ? "Project Title" : (extractPeerPromptText(input) || extractQuestionText(container, [input]));
+
+            questions.push({
+                id: input.name || input.id || `text_${idx}`,
+                type: "text",
+                isTitle,
+                question: questionText || `Question ${idx + 1}`,
+                inputElement: input,
+                container,
+            });
+        });
+
+        // Sort questions by DOM position (top to bottom)
+        questions.sort((a, b) => {
+            try {
+                const posA = a.container ? a.container.getBoundingClientRect().top + window.scrollY : 0;
+                const posB = b.container ? b.container.getBoundingClientRect().top + window.scrollY : 0;
+                return posA - posB;
+            } catch (_) {
+                return 0;
+            }
+        });
+
+        return questions;
+    }
+
+    function validateQuestionElementAnswered(q) {
+        if (!q) return false;
+        if (q.type === "single_choice" || q.type === "multi_select" || q.type === "mcq") {
+            if (q.optionElements && q.optionElements.length) {
+                const hasChecked = q.optionElements.some((opt) => {
+                    const inp = opt.input;
+                    if (!inp) return false;
+                    return Boolean(inp.checked || inp.getAttribute("aria-checked") === "true");
+                });
+                if (hasChecked) return true;
+            }
+
+            if (q.container) {
+                const checkedInContainer = q.container.querySelector(
+                    'input[type="radio"]:checked, input[type="checkbox"]:checked, [role="radio"][aria-checked="true"], [role="checkbox"][aria-checked="true"]'
+                );
+                if (checkedInContainer && !isHonorCodeControl(checkedInContainer)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if (q.type === "text") {
+            const input = q.inputElement || (q.container && q.container.querySelector('textarea, input:not([type]), input[type="text"], div[contenteditable="true"], div[role="textbox"]'));
+            if (!input) return false;
+
+            const errorEl = q.container && q.container.querySelector('[class*="error" i], [class*="invalid" i], [role="alert"]');
+            const containerNotice = errorEl ? cleanText(errorEl.textContent) : (q.container ? cleanText(q.container.textContent) : "");
+
+            let val = "";
+            if (input.isContentEditable || input.getAttribute("contenteditable") === "true" || input.getAttribute("role") === "textbox") {
+                val = cleanText(input.innerText || input.textContent || "");
+            } else {
+                val = cleanText(input.value || "");
+            }
+
+            if (typeof isTextQuestionAnswered === "function") {
+                return isTextQuestionAnswered({
+                    isTitle: Boolean(q.isTitle),
+                    text: val,
+                    containerNotice,
+                    minLength: 50,
+                });
+            }
+
+            if (/^(enter text here|type your response|viết câu trả lời)$/i.test(val)) return false;
+            if (CourseRunnerHelpers && CourseRunnerHelpers.isUnansweredNoticeText && CourseRunnerHelpers.isUnansweredNoticeText(containerNotice)) {
+                return false;
+            }
+            return q.isTitle ? val.length > 0 : val.length >= 50;
+        }
+
+        return true;
+    }
+
+    function findDomValidationErrors() {
+        const errors = [];
+        const candidates = Array.from(
+            document.querySelectorAll(
+                '[aria-invalid="true"], [role="alert"], [class*="error" i], [class*="invalid" i], [data-testid*="error" i], [class*="alert" i]'
+            )
+        );
+
+        for (const el of candidates) {
+            if (el.offsetParent === null && !el.getClientRects().length) {
+                continue;
+            }
+            if (isHonorCodeControl(el)) {
+                continue;
+            }
+
+            const text = cleanText(el.textContent);
+            if (!text || text.length > 300) continue;
+
+            if (CourseRunnerHelpers && CourseRunnerHelpers.isUnansweredNoticeText) {
+                if (CourseRunnerHelpers.isUnansweredNoticeText(text)) {
+                    errors.push(text);
+                    continue;
+                }
+            }
+
+            if (el.getAttribute("aria-invalid") === "true") {
+                errors.push(text || "Invalid question input");
+            }
+        }
+
+        return Array.from(new Set(errors));
+    }
+
+    async function attemptAutoFillMissingQuestions(unansweredQuestions, currentItem, mode) {
+        if (!Array.isArray(unansweredQuestions) || !unansweredQuestions.length) return;
+
+        logRunner("quiz_autofill_missing_start", {
+            ...summarizeItem(currentItem),
+            missingCount: unansweredQuestions.length,
+        }, { mode });
+
+        for (const q of unansweredQuestions) {
+            if ((q.type === "single_choice" || q.type === "multi_select" || q.type === "mcq") && q.optionElements && q.optionElements.length) {
+                const wrongOptions = [
+                    ...(q.memory && Array.isArray(q.memory.knownWrongOptions) ? q.memory.knownWrongOptions : []),
+                    ...(q.memory && Array.isArray(q.memory.wrongAttempts) && (q.type === "single_choice" || q.type === "mcq")
+                        ? q.memory.wrongAttempts.flatMap((w) => Array.isArray(w.options) ? w.options : [w.options])
+                        : []),
+                    ...(q.matchedPreviousQ && (q.matchedPreviousQ.status === "incorrect" || q.matchedPreviousQ.status === "unpassed_attempt") && (q.type === "single_choice" || q.type === "mcq") && Array.isArray(q.matchedPreviousQ.chosenOptions)
+                        ? q.matchedPreviousQ.chosenOptions
+                        : []),
+                ];
+                const safeIdx = q.optionElements.findIndex((opt) =>
+                    !wrongOptions.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, opt.text))
+                );
+                const targetIdx = safeIdx !== -1 ? safeIdx : 0;
+                selectOptionInput(q.optionElements[targetIdx].input, true);
+                q.actualChosenIndexes = [targetIdx];
+                q.actualChosenOptions = [q.optionElements[targetIdx].text];
+                await delay(150);
+            } else if (q.type === "text" && q.inputElement) {
+                const fallbackText = generateFallbackTextAnswer(q.question, currentItem.title, q.isTitle);
+                await fillTextInput(q.inputElement, fallbackText);
+                q.actualChosenOptions = [fallbackText];
+                await delay(350);
+            }
+        }
+
+        await delay(500);
+    }
+
+    function getQuizMemoryKey(courseSlug) {
+        return `courseraQuizMemory:${courseSlug || "global"}`;
+    }
+
+    async function loadCourseQuizMemory(courseSlug) {
+        const key = getQuizMemoryKey(courseSlug);
+        const result = await storageGet([key]);
+        const memory = result[key] || { questions: {}, updatedAt: Date.now() };
+        if (!memory.questions) {
+            memory.questions = {};
+        }
+        return memory;
+    }
+
+    async function saveCourseQuizMemory(courseSlug, memory) {
+        const key = getQuizMemoryKey(courseSlug);
+        memory.updatedAt = Date.now();
+        await storageSet({ [key]: memory });
+    }
+
+    async function getQuizMaxRetries() {
+        const settings = await storageGet(["quizMaxRetries"]);
+        const parsed = Number(settings && settings.quizMaxRetries);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2;
+    }
+
+    async function getQuizPassingThreshold() {
+        const settings = await storageGet(["quizPassingThreshold"]);
+        const parsed = Number(settings && settings.quizPassingThreshold);
+        if (Number.isFinite(parsed) && parsed > 0 && parsed <= 100) {
+            cachedPassingThreshold = parsed;
+            return parsed;
+        }
+        return cachedPassingThreshold;
+    }
+
+    function findViewFeedbackButton() {
+        const directLink = document.querySelector(
+            'a[href*="/view-feedback"], [data-testid*="view-feedback" i], [data-testid*="ViewFeedback" i], [aria-label*="feedback" i]'
+        );
+        if (directLink && !isButtonDisabled(directLink)) {
+            return directLink;
+        }
+
+        return findActionButton((label) => /(?:view feedback|xem phản hồi|view result|xem kết quả)/i.test(cleanText(label)));
+    }
+
+    function findRetryQuizButton() {
+        const directBtn = document.querySelector(
+            '[data-testid*="retry" i], [data-testid*="retake" i], [aria-label*="retry" i], [aria-label*="retake" i]'
+        );
+        if (directBtn) {
+            return directBtn;
+        }
+
+        const isFeedbackUrl = /\/(view-feedback|feedback)$/i.test(location.pathname);
+        if (isFeedbackUrl) {
+            const attemptLink = document.querySelector('a[href*="/attempt"]');
+            if (attemptLink) {
+                return attemptLink;
+            }
+        }
+
+        if (CourseRunnerHelpers && typeof CourseRunnerHelpers.isRetryActionLabel === "function") {
+            const btn = findActionButton(CourseRunnerHelpers.isRetryActionLabel);
+            if (btn) return btn;
+        }
+
+        return findActionButton((label) => {
+            const clean = String(label || "").replace(/^[^a-zA-Z0-9]+/, "").trim();
+            if (isFeedbackUrl && /^(resume|start|begin)\b/i.test(clean) && !/cancel|back|return/i.test(clean)) {
+                return true;
+            }
+            return /^(retry|try again|retake|take again|retake quiz|start next attempt|start new attempt|start attempt|làm lại|thử lại)/i.test(clean);
+        });
+    }
+
+    function extractQuestionFeedback(container) {
+        if (!container) return "";
+        const feedbackEl = container.querySelector(
+            '.rc-QuestionFeedback, .rc-FormPartsQuestionFeedback, [data-testid*="feedback" i], [data-testid*="Feedback" i], ' +
+            '[class*="QuestionFeedback" i], [class*="FormPartsQuestionFeedback" i], ' +
+            '[class*="Explanation" i], [class*="explanation" i], [role="alert"], ' +
+            '[class*="callout" i], [class*="Callout" i], [class*="ItemFeedback" i], ' +
+            '[class*="feedback" i]:not(button):not(a), [class*="Feedback" i]:not(button):not(a)'
+        );
+        if (feedbackEl) {
+            const text = cleanText(feedbackEl.textContent);
+            if (text && text.length > 5) return text;
+        }
+
+        const elements = Array.from(container.querySelectorAll('div, p, span, section'));
+        for (const el of elements) {
+            if (el.children.length > 4) continue;
+            const text = cleanText(el.textContent);
+            if (/^(not quite|try again|almost|correct|incorrect|hint|explanation|feedback)/i.test(text) && text.length > 15) {
+                return text;
+            }
+        }
+        return "";
+    }
+
+    function extractQuizReviewFromDom(pendingAttempt) {
+        let questionContainers = Array.from(
+            document.querySelectorAll(
+                '.rc-FormPartsQuestion, [data-testid*="question" i], [data-testid*="Question" i], ' +
+                '[class*="FormPartsQuestion" i], [class*="QuestionPart" i], [class*="quiz-question" i], ' +
+                '[class*="QuestionPrompt" i], [class*="QuestionContainer" i], [class*="ItemQuestion" i], ' +
+                '[class*="question-card" i], fieldset[class*="question" i], div[id*="question" i]'
+            )
+        );
+
+        if (!questionContainers.length) {
+            const allInputs = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'));
+            const set = new Set();
+            allInputs.forEach((inp) => {
+                const c = findQuestionContainer(inp);
+                if (c) set.add(c);
+            });
+            questionContainers = Array.from(set);
+        }
+
+        if (!questionContainers.length) {
+            return [];
+        }
+
+        const reviewedQuestions = [];
+
+        questionContainers.forEach((container) => {
+            const inputs = Array.from(container.querySelectorAll('input[type="radio"], input[type="checkbox"], input, textarea, [role="radio"], [role="checkbox"]'));
+            const promptText = extractQuestionText(container, inputs);
+            if (!promptText) return;
+
+            const fingerprint = CourseRunnerHelpers && CourseRunnerHelpers.normalizeQuestionKey
+                ? CourseRunnerHelpers.normalizeQuestionKey(promptText)
+                : promptText.toLowerCase().trim();
+
+            // 1. Determine points & status
+            const pointsEl = container.querySelector(
+                '[class*="point" i], [class*="grade" i], [class*="score" i], [data-testid*="point" i], [data-testid*="grade" i], [aria-label*="point" i], [aria-label*="grade" i]'
+            );
+            const pointsObj = (pointsEl && CourseRunnerHelpers && CourseRunnerHelpers.extractPointsFromText)
+                ? CourseRunnerHelpers.extractPointsFromText(pointsEl.textContent)
+                : (CourseRunnerHelpers && CourseRunnerHelpers.extractPointsFromText
+                    ? CourseRunnerHelpers.extractPointsFromText(container.textContent)
+                    : null);
+
+            const hasCorrectIcon = Boolean(container.querySelector(
+                '[data-testid*="check-circle" i], [data-testid*="CheckCircle" i], svg[data-testid*="correct" i]'
+            ));
+            const hasIncorrectIcon = Boolean(container.querySelector(
+                '[aria-label*="incorrect" i], svg[data-testid*="cancel" i], svg[data-testid*="Cancel" i], svg[data-testid*="error" i], svg[data-testid*="Close" i], svg[data-testid*="close" i], svg[data-testid*="incorrect" i]'
+            ));
+
+            let status = "unknown";
+            if (hasIncorrectIcon) {
+                status = "incorrect";
+            } else if (pointsObj) {
+                status = CourseRunnerHelpers.classifyReviewStatus("", pointsObj.earned, pointsObj.total);
+            } else if (hasCorrectIcon) {
+                status = "correct";
+            } else {
+                const containerText = cleanText(container.textContent);
+                status = CourseRunnerHelpers && CourseRunnerHelpers.classifyReviewStatus
+                    ? CourseRunnerHelpers.classifyReviewStatus(containerText)
+                    : "unknown";
+            }
+
+            const hasCheckbox = inputs.some((inp) => inp.type === "checkbox" || inp.getAttribute("role") === "checkbox") ||
+                /select all that apply|all that apply|choose all/i.test(promptText);
+            const questionType = hasCheckbox ? "multi_select" : "single_choice";
+
+            // 2. Determine chosen options & specific wrong options
+            const chosenOptions = [];
+            const specificWrongOptions = [];
+            let questionFeedback = extractQuestionFeedback(container);
+
+            // A. Check input elements if present
+            inputs.forEach((input) => {
+                const isChecked = Boolean(
+                    input.checked ||
+                    input.getAttribute("aria-checked") === "true" ||
+                    input.hasAttribute("checked") ||
+                    (input.closest && input.closest('label, li, [class*="option" i], [data-testid*="option" i]')?.querySelector('[aria-label*="selected" i], [aria-label*="checked" i], [class*="checked" i], [class*="selected" i], [data-testid*="checked" i], svg[data-testid*="Selected" i], svg[data-testid*="RadioChecked" i], svg[data-testid*="CheckboxChecked" i]'))
+                );
+                const labelText = extractOptionText(input);
+
+                if (isChecked && labelText && !chosenOptions.includes(labelText)) {
+                    chosenOptions.push(labelText);
+                }
+
+                // Check for option-level feedback: "This should not be selected", "Try again", "Incorrect", etc.
+                const optionParent = input.closest
+                    ? (input.closest('label, li, [class*="option" i], [data-testid*="option" i]') || input.parentElement)
+                    : input.parentElement;
+
+                if (optionParent) {
+                    const optFeedbackText = cleanText(optionParent.textContent);
+                    if (/(?:this should not be selected|should not be selected|incorrect option|try again|not quite)/i.test(optFeedbackText)) {
+                        if (labelText && !specificWrongOptions.includes(labelText)) {
+                            specificWrongOptions.push(labelText);
+                        }
+                        if (labelText && !chosenOptions.includes(labelText)) {
+                            chosenOptions.push(labelText);
+                        }
+                        if (!questionFeedback || questionFeedback.length < 15) {
+                            questionFeedback = optFeedbackText;
+                        }
+                    }
+                }
+            });
+
+            // B. Also scan option wrapper blocks directly (essential when Coursera renders read-only feedback without inputs)
+            const optionWrappers = Array.from(container.querySelectorAll(
+                '.rc-Option, [data-testid*="Option" i], [class*="Option" i], [class*="choice" i], [class*="Choice" i], [class*="option-contents" i], label, li'
+            )).filter((el) => {
+                // Keep only top-level option containers
+                return !el.parentElement || !el.parentElement.closest('.rc-Option, [data-testid*="Option" i], [class*="Option" i]');
+            });
+
+            optionWrappers.forEach((wrapper) => {
+                const wrapperText = cleanText(wrapper.textContent);
+                if (!wrapperText || wrapperText.length < 2) return;
+
+                const hasSelectedMarker = Boolean(
+                    wrapper.querySelector('[aria-label*="selected" i], [aria-label*="checked" i], [class*="checked" i], [class*="selected" i], svg[data-testid*="Selected" i], svg[data-testid*="RadioChecked" i], svg[data-testid*="CheckboxChecked" i]') ||
+                    wrapper.getAttribute("aria-checked") === "true" ||
+                    wrapper.getAttribute("aria-selected") === "true"
+                );
+
+                const hasWrongFeedback = /(?:this should not be selected|should not be selected|incorrect option|try again|not quite)/i.test(wrapperText);
+
+                // Clone and strip feedback/SVGs to extract only the option text
+                let cleanOptText = "";
+                try {
+                    const clone = wrapper.cloneNode(true);
+                    clone.querySelectorAll(
+                        '.rc-OptionFeedback, .rc-QuestionFeedback, [class*="Feedback" i], [class*="feedback" i], [role="alert"], [aria-live], svg, button'
+                    ).forEach((e) => e.remove());
+                    cleanOptText = cleanText(clone.textContent);
+                } catch (_) {
+                    cleanOptText = wrapperText;
+                }
+
+                if (cleanOptText && cleanOptText.length > 0) {
+                    if (hasSelectedMarker || hasWrongFeedback) {
+                        if (!chosenOptions.some((c) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(c, cleanOptText))) {
+                            chosenOptions.push(cleanOptText);
+                        }
+                    }
+                    if (hasWrongFeedback) {
+                        if (!specificWrongOptions.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, cleanOptText))) {
+                            specificWrongOptions.push(cleanOptText);
+                        }
+                        if (!questionFeedback || questionFeedback.length < 15) {
+                            questionFeedback = wrapperText;
+                        }
+                    }
+                }
+            });
+
+            // If DOM didn't expose checked state (e.g. read-only text view), correlate with pendingAttempt
+            if (!chosenOptions.length && pendingAttempt && Array.isArray(pendingAttempt.questions)) {
+                const matchedQ = pendingAttempt.questions.find((pq) =>
+                    pq && (
+                        (pq.fingerprint && pq.fingerprint === fingerprint) ||
+                        (pq.prompt && promptText && (pq.prompt.includes(promptText) || promptText.includes(pq.prompt)))
+                    )
+                );
+                if (matchedQ && Array.isArray(matchedQ.chosenOptions)) {
+                    chosenOptions.push(...matchedQ.chosenOptions);
+                }
+            }
+
+            // If question status is incorrect or scored 0 points, any chosen option is definitely wrong!
+            if (status === "incorrect" && chosenOptions.length > 0) {
+                chosenOptions.forEach((opt) => {
+                    if (!specificWrongOptions.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, opt))) {
+                        specificWrongOptions.push(opt);
+                    }
+                });
+            }
+
+            // 3. Look for revealed correct answer text
+            let revealedAnswer = "";
+            const correctMatch = container.textContent.match(/(?:correct answer|correct response|expected answer)\s*:\s*([^.\n]+)/i);
+            if (correctMatch) {
+                revealedAnswer = cleanText(correctMatch[1]);
+            }
+
+            reviewedQuestions.push({
+                prompt: promptText,
+                fingerprint,
+                type: questionType,
+                hasCheckbox,
+                status,
+                points: pointsObj,
+                chosenOptions,
+                specificWrongOptions,
+                revealedAnswer,
+                feedback: questionFeedback,
+            });
+        });
+
+        return reviewedQuestions;
+    }
+
+    async function recordQuizResults(currentItem, finalState, pendingAttempt) {
+        const courseSlug = deriveCourseSlug();
+        if (!courseSlug) return;
+
+        if (!pendingAttempt) {
+            try {
+                const saved = sessionStorage.getItem("autocoursera:lastSubmission");
+                if (saved) {
+                    pendingAttempt = JSON.parse(saved);
+                }
+            } catch (e) {}
+        }
+
+        try {
+            const memory = await loadCourseQuizMemory(courseSlug);
+            const reviewedDomQuestions = extractQuizReviewFromDom(pendingAttempt);
+            const pageText = getMainContentText();
+            const scorePercent = CourseRunnerHelpers && CourseRunnerHelpers.extractGradePercentage
+                ? CourseRunnerHelpers.extractGradePercentage(pageText)
+                : null;
+            const passingThreshold = CourseRunnerHelpers && CourseRunnerHelpers.extractPassingThreshold
+                ? CourseRunnerHelpers.extractPassingThreshold(pageText, cachedPassingThreshold)
+                : cachedPassingThreshold;
+
+            const itemSlug = getItemSlug(currentItem.path) || currentItem.path || "quiz";
+            if (!memory.quizAttempts) {
+                memory.quizAttempts = {};
+            }
+            if (!memory.quizAttempts[itemSlug]) {
+                memory.quizAttempts[itemSlug] = [];
+            }
+
+            // 1. Build attempt questions record
+            let attemptQuestions = [];
+            if (reviewedDomQuestions.length > 0) {
+                attemptQuestions = reviewedDomQuestions.map((rdq, idx) => ({
+                    index: idx,
+                    prompt: rdq.prompt,
+                    fingerprint: rdq.fingerprint,
+                    type: rdq.type,
+                    chosenOptions: rdq.chosenOptions,
+                    status: rdq.status,
+                    pointsEarned: rdq.points?.earned,
+                    pointsTotal: rdq.points?.total,
+                    feedback: rdq.feedback,
+                }));
+            } else if (pendingAttempt && Array.isArray(pendingAttempt.questions)) {
+                attemptQuestions = pendingAttempt.questions.map((pq, idx) => ({
+                    index: idx,
+                    prompt: pq.prompt,
+                    fingerprint: pq.fingerprint,
+                    type: pq.type,
+                    allOptions: pq.allOptions || [],
+                    chosenOptions: pq.chosenOptions || [],
+                    status: finalState === "passed" ? "correct" : (scorePercent === 0 ? "incorrect" : "unpassed_attempt"),
+                    feedback: finalState === "passed" ? "Passed" : (scorePercent !== null ? `Overall score: ${scorePercent}%` : "Attempt failed"),
+                }));
+            }
+
+            // 2. Save into memory.quizAttempts[itemSlug]
+            if (attemptQuestions.length > 0) {
+                const feedbackFrameEl = document.querySelector('main, [role="main"], .rc-QuizReview, [class*="QuizReview" i], [class*="AssignmentReview" i]') || document.body;
+                const rawFeedbackText = cleanText(feedbackFrameEl ? feedbackFrameEl.textContent : "");
+                const newAttempt = {
+                    attemptNumber: (memory.quizAttempts[itemSlug].length || 0) + 1,
+                    timestamp: Date.now(),
+                    scorePercent,
+                    gradeText: scorePercent !== null ? `${scorePercent}%` : (finalState === "passed" ? "Passed" : "Failed"),
+                    passingThreshold,
+                    finalState,
+                    rawFeedback: rawFeedbackText ? rawFeedbackText.slice(0, 3000) : "",
+                    questions: attemptQuestions,
+                };
+                if (CourseRunnerHelpers && CourseRunnerHelpers.recordQuizAttemptHistory) {
+                    memory.quizAttempts[itemSlug] = CourseRunnerHelpers.recordQuizAttemptHistory(
+                        memory.quizAttempts[itemSlug],
+                        newAttempt
+                    );
+                } else {
+                    memory.quizAttempts[itemSlug].push(newAttempt);
+                    if (memory.quizAttempts[itemSlug].length > 10) {
+                        memory.quizAttempts[itemSlug].splice(0, memory.quizAttempts[itemSlug].length - 10);
+                    }
+                }
+            }
+
+            // 3. Update individual question memory
+            let recordedCount = 0;
+            if (reviewedDomQuestions.length > 0) {
+                reviewedDomQuestions.forEach((reviewed) => {
+                    if (!reviewed || !reviewed.fingerprint) return;
+                    const fp = reviewed.fingerprint;
+                    const existing = memory.questions[fp];
+                    if (CourseRunnerHelpers && CourseRunnerHelpers.mergeQuestionMemory) {
+                        memory.questions[fp] = CourseRunnerHelpers.mergeQuestionMemory(existing, reviewed);
+                        recordedCount++;
+                    }
+                });
+            } else if (pendingAttempt && Array.isArray(pendingAttempt.questions)) {
+                const isPassed = finalState === "passed";
+                pendingAttempt.questions.forEach((pq) => {
+                    if (!pq) return;
+                    const fp = pq.fingerprint || (pq.prompt ? (CourseRunnerHelpers?.normalizeQuestionKey ? CourseRunnerHelpers.normalizeQuestionKey(pq.prompt) : pq.prompt.toLowerCase().trim()) : null);
+                    if (!fp) return;
+                    const existing = memory.questions[fp];
+                    if (CourseRunnerHelpers && CourseRunnerHelpers.mergeQuestionMemory) {
+                        const qStatus = isPassed ? "correct" : (scorePercent === 0 ? "incorrect" : "unpassed_attempt");
+                        memory.questions[fp] = CourseRunnerHelpers.mergeQuestionMemory(existing, {
+                            prompt: pq.prompt || "",
+                            type: pq.type || "single_choice",
+                            chosenOptions: pq.chosenOptions || [],
+                            status: qStatus,
+                        });
+                        recordedCount++;
+                    }
+                });
+            }
+
+            await saveCourseQuizMemory(courseSlug, memory);
+            logRunner("quiz_memory_updated", {
+                ...summarizeItem(currentItem),
+                recordedCount,
+                scorePercent,
+                totalAttempts: memory.quizAttempts[itemSlug]?.length || 1,
+                totalQuestionsInMemory: Object.keys(memory.questions).length,
+                finalState,
+            });
+        } catch (err) {
+            console.warn("Failed to record quiz memory:", err);
+        }
+    }
+
+    async function solveQuizDirectlyFromDom(currentItem, mode) {
+        // Automatically scroll through all containers & unlock trapped overflow so all questions are loaded
+        await ensureAllQuizContentScrolledAndLoaded(mode);
+
+        let questions = extractQuizQuestionsFromDom();
+        if (!questions.length) {
+            logRunnerWarn("quiz_dom_no_questions", {
+                ...summarizeItem(currentItem),
+                message: "No quiz questions found on page DOM. Checking Vision navigation fallback...",
+            });
+
+            const visionClicked = await attemptVisionNavigationFallback(currentItem, mode, "no_dom_questions");
+            if (visionClicked) {
+                await delay(3000);
+                await ensureAllQuizContentScrolledAndLoaded(mode);
+                questions = extractQuizQuestionsFromDom();
+            }
+
+            if (!questions.length) {
+                return false;
+            }
+        }
+
+        logRunner("quiz_dom_questions_found", {
+            ...summarizeItem(currentItem),
+            count: questions.length,
+            types: questions.map((q) => q.type),
+        }, { mode });
+
+        const courseSlug = deriveCourseSlug();
+        const courseMemory = courseSlug ? await loadCourseQuizMemory(courseSlug) : { questions: {}, quizAttempts: {} };
+        const itemSlug = getItemSlug(currentItem.path) || currentItem.path || "quiz";
+        const itemAttempts = (courseMemory.quizAttempts && (courseMemory.quizAttempts[itemSlug] || courseMemory.quizAttempts[currentItem.path])) || [];
+        const lastAttempt = itemAttempts.length > 0 ? itemAttempts[itemAttempts.length - 1] : null;
+
+        const previousAttemptReport = CourseRunnerHelpers && CourseRunnerHelpers.buildPreviousAttemptReport
+            ? CourseRunnerHelpers.buildPreviousAttemptReport(itemAttempts, currentItem)
+            : null;
+
+        if (previousAttemptReport) {
+            logRunner("quiz_previous_attempt_attached", {
+                ...summarizeItem(currentItem),
+                previousScore: previousAttemptReport.previousScore,
+                attemptNumber: previousAttemptReport.attemptNumber,
+            }, { mode });
+        }
+
+        // 1. Match each question with memory & previous attempt
+        questions.forEach((q) => {
+            const fp = CourseRunnerHelpers && CourseRunnerHelpers.normalizeQuestionKey
+                ? CourseRunnerHelpers.normalizeQuestionKey(q.question)
+                : q.question.toLowerCase().trim();
+            q.fingerprint = fp;
+            q.memory = courseMemory.questions[fp] || null;
+
+            // Match with question from previous attempt
+            const matchedPreviousQ = lastAttempt?.questions?.find((pq) =>
+                pq && (
+                    (pq.fingerprint && pq.fingerprint === fp) ||
+                    (pq.prompt && q.question && (
+                        CourseRunnerHelpers && CourseRunnerHelpers.normalizeQuestionKey
+                            ? CourseRunnerHelpers.normalizeQuestionKey(pq.prompt) === CourseRunnerHelpers.normalizeQuestionKey(q.question)
+                            : pq.prompt.trim().toLowerCase() === q.question.trim().toLowerCase()
+                    ))
+                )
+            );
+            q.matchedPreviousQ = matchedPreviousQ || null;
+
+            // Check if confirmed correct options exist in memory
+            if (q.memory && Array.isArray(q.memory.confirmedCorrectOptions) && q.memory.confirmedCorrectOptions.length > 0 && q.optionElements && q.optionElements.length) {
+                const allKnownWrongs = [
+                    ...(q.memory && Array.isArray(q.memory.knownWrongOptions) ? q.memory.knownWrongOptions : []),
+                    ...(q.memory && Array.isArray(q.memory.wrongAttempts) ? q.memory.wrongAttempts.flatMap((w) => Array.isArray(w.options) ? w.options : [w.options]) : []),
+                    ...(q.matchedPreviousQ && (q.matchedPreviousQ.status === "incorrect" || q.matchedPreviousQ.status === "unpassed_attempt") && (q.type === "single_choice" || q.type === "mcq") && Array.isArray(q.matchedPreviousQ.chosenOptions) ? q.matchedPreviousQ.chosenOptions : [])
+                ];
+
+                const confirmed = q.memory.confirmedCorrectOptions.filter(
+                    (c) => !allKnownWrongs.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, c))
+                );
+
+                if (confirmed.length > 0) {
+                    if (q.type === "single_choice" || q.type === "mcq") {
+                        const matchIdx = q.optionElements.findIndex((opt) =>
+                            confirmed.some((c) => CourseRunnerHelpers.isOptionMatching(opt.text, c))
+                        );
+                        if (matchIdx !== -1) {
+                            q.resolvedTargetIndexes = [matchIdx];
+                        }
+                    } else if (q.type === "multi_select") {
+                        const matchIndexes = [];
+                        q.optionElements.forEach((opt, optIdx) => {
+                            if (confirmed.some((c) => CourseRunnerHelpers.isOptionMatching(opt.text, c))) {
+                                matchIndexes.push(optIdx);
+                            }
+                        });
+                        if (matchIndexes.length === confirmed.length && matchIndexes.length > 0) {
+                            q.resolvedTargetIndexes = matchIndexes;
+                        }
+                    }
+                }
+            }
+        });
+
+        const memoryResolvedCount = questions.filter((q) => q.resolvedTargetIndexes).length;
+        if (memoryResolvedCount > 0) {
+            logRunner("quiz_memory_prefilled", {
+                ...summarizeItem(currentItem),
+                resolvedCount: memoryResolvedCount,
+                totalQuestions: questions.length,
+            }, { mode });
+        }
+
+        // 2. Build prompt for AI for questions needing AI
+        let answers = [];
+        const questionsNeedingAi = questions.filter((q) => !q.resolvedTargetIndexes);
+
+        if (questionsNeedingAi.length > 0) {
+            const formattedQuestions = questions.map((q, idx) => {
+                const memPrompt = q.memory && CourseRunnerHelpers && CourseRunnerHelpers.formatMemoryForPrompt
+                    ? CourseRunnerHelpers.formatMemoryForPrompt(q.memory)
+                    : null;
+                const prevSummary = q.matchedPreviousQ && CourseRunnerHelpers && CourseRunnerHelpers.formatQuestionPreviousAttempt
+                    ? CourseRunnerHelpers.formatQuestionPreviousAttempt(q.matchedPreviousQ, lastAttempt?.scorePercent, lastAttempt?.passingThreshold)
+                    : null;
+
+                let instruction = q.isTitle
+                    ? `Project Title: Provide a concise, descriptive, professional project title (under 12 words) relevant to ${currentItem.title} and the course in 'content'.`
+                    : (q.type === "multi_select"
+                        ? "Multi-select (checkboxes): There may be MORE THAN ONE correct option. Select ALL correct options! correctOptionsIndex MUST contain all correct zero-based indexes."
+                        : (q.type === "text"
+                            ? "Free-response / essay / peer assignment (type 'text'): Write a thorough, comprehensive, professional response (at least 150-250 words) addressing all concepts, criteria, and nuances of the prompt in 'content'. Provide rich, structured paragraphs and bullet points so that length requirements are completely satisfied."
+                            : "Single-choice (radio): Exactly ONE option is correct."));
+
+                if (memPrompt) {
+                    instruction += ` ${memPrompt}`;
+                }
+                if (prevSummary) {
+                    instruction += ` ${prevSummary}`;
+                }
+
+                const specificFeedback = q.matchedPreviousQ?.feedback || q.memory?.lastFeedback;
+                if (specificFeedback && specificFeedback !== "Incorrect" && specificFeedback !== "Passed" && !instruction.includes(specificFeedback)) {
+                    instruction += ` COURSERA FEEDBACK / EXPLANATION: "${specificFeedback}". Use this hint to identify the true correct answer.`;
+                }
+
+                const allWrongs = Array.from(new Set([
+                    ...(q.memory && Array.isArray(q.memory.knownWrongOptions) ? q.memory.knownWrongOptions : []),
+                    ...(q.memory && Array.isArray(q.memory.wrongAttempts) ? q.memory.wrongAttempts.flatMap((w) => Array.isArray(w.options) ? w.options : [w.options]) : []),
+                    ...(q.matchedPreviousQ && (q.matchedPreviousQ.status === "incorrect" || q.matchedPreviousQ.status === "unpassed_attempt") && Array.isArray(q.matchedPreviousQ.chosenOptions) ? q.matchedPreviousQ.chosenOptions : []),
+                ])).filter(Boolean);
+
+                if (allWrongs.length > 0) {
+                    instruction += ` CRITICAL FAILURE FROM PREVIOUS ATTEMPT: You previously selected ${JSON.stringify(allWrongs)} and failed (0 points). Coursera explanation: "${specificFeedback || "Incorrect"}". YOU MUST ELIMINATE ${JSON.stringify(allWrongs)} AND CHOOSE A DIFFERENT VALID OPTION!`;
+                }
+
+                return {
+                    index: idx,
+                    type: q.type,
+                    question: q.question,
+                    options: q.options || [],
+                    instruction,
+                    knownWrongOptionsToAvoid: allWrongs,
+                    courseraFeedbackHint: specificFeedback || undefined,
+                    previousAttempt: q.matchedPreviousQ ? {
+                        submittedOptions: q.matchedPreviousQ.chosenOptions || [],
+                        status: q.matchedPreviousQ.status || "unpassed",
+                        points: q.matchedPreviousQ.pointsEarned !== undefined && q.matchedPreviousQ.pointsTotal !== undefined
+                            ? `${q.matchedPreviousQ.pointsEarned}/${q.matchedPreviousQ.pointsTotal}`
+                            : undefined,
+                        feedback: q.matchedPreviousQ.feedback || q.memory?.lastFeedback || undefined,
+                    } : (q.memory?.lastFeedback ? { feedback: q.memory.lastFeedback } : undefined),
+                    previousAttemptFeedback: q.memory ? {
+                        confirmedCorrect: q.memory.confirmedCorrectOptions || [],
+                        knownWrongOptions: q.memory.knownWrongOptions || [],
+                        wrongCombinations: (q.memory.wrongAttempts || []).map((w) => w.options),
+                        courseraHints: q.memory.feedbacks || (q.memory.lastFeedback ? [q.memory.lastFeedback] : []),
+                    } : undefined,
+                };
+            });
+
+            const assignmentScenario = extractAssignmentScenarioContext();
+            if (assignmentScenario) {
+                logRunner("quiz_assignment_context_found", {
+                    ...summarizeItem(currentItem),
+                    contextLength: assignmentScenario.length,
+                }, { mode });
+            }
+
+            const promptPayload = {
+                quizTitle: currentItem.title,
+                itemPath: currentItem.path,
+                assignmentContext: assignmentScenario || undefined,
+                previousAttemptReport: previousAttemptReport || undefined,
+                questions: formattedQuestions,
+            };
+
+            logRunner("quiz_ai_request_start", {
+                ...summarizeItem(currentItem),
+                questionCount: questions.length,
+                unresolvedCount: questionsNeedingAi.length,
+            }, { mode });
+
+            const AIClass = window.GeminiAI || window.GroqAI || window.ChatGPTAI;
+            if (!AIClass) {
+                logRunnerWarn("quiz_error", {
+                    ...summarizeItem(currentItem),
+                    message: "AI helper class not found in window context.",
+                });
+                return false;
+            }
+
+            const ai = new AIClass();
+            let screenshotUrl = null;
+            const hasTextQuestion = questions.some((q) => q.type === "text");
+            if (hasTextQuestion) {
+                try {
+                    screenshotUrl = await captureCurrentTabScreenshot();
+                    if (screenshotUrl) {
+                        logRunner("quiz_essay_screenshot_captured", {
+                            ...summarizeItem(currentItem),
+                            textQuestionCount: questions.filter((q) => q.type === "text").length,
+                        }, { mode });
+                    }
+                } catch (captureErr) {
+                    console.warn("Screenshot capture error for essay question:", captureErr);
+                }
+            }
+
+            try {
+                answers = await ai.solveQuestions(
+                    JSON.stringify(promptPayload, null, 2),
+                    { screenshotUrl }
+                );
+            } catch (err) {
+                if (screenshotUrl) {
+                    try {
+                        logRunner("quiz_ai_text_retry", {
+                            ...summarizeItem(currentItem),
+                            reason: "Vision failed, retrying text-only",
+                        }, { mode });
+                        answers = await ai.solveQuestions(
+                            JSON.stringify(promptPayload, null, 2),
+                            {}
+                        );
+                    } catch (textErr) {
+                        logRunnerWarn("quiz_ai_error", {
+                            ...summarizeItem(currentItem),
+                            error: textErr && textErr.message,
+                        });
+                        return false;
+                    }
+                } else {
+                    logRunnerWarn("quiz_ai_error", {
+                        ...summarizeItem(currentItem),
+                        error: err && err.message,
+                    });
+                    return false;
+                }
+            }
+
+            if (!Array.isArray(answers) || !answers.length) {
+                logRunnerWarn("quiz_ai_empty_answers", {
+                    ...summarizeItem(currentItem),
+                });
+                return false;
+            }
+
+            logRunner("quiz_ai_answers_received", {
+                ...summarizeItem(currentItem),
+                answerCount: answers.length,
+            }, { mode });
+        }
+
+        let filledCount = 0;
+        for (let qIndex = 0; qIndex < questions.length; qIndex++) {
+            const q = questions[qIndex];
+            const answer = answers[qIndex] || answers[String(qIndex)];
+
+            if ((q.type === "single_choice" || q.type === "multi_select" || q.type === "mcq") && q.optionElements && q.optionElements.length) {
+                const targetIndexes = new Set();
+
+                // If resolved from confirmed memory, use it directly!
+                if (q.resolvedTargetIndexes) {
+                    q.resolvedTargetIndexes.forEach((idx) => targetIndexes.add(idx));
+                } else if (answer) {
+                    // Collect from AI correctOptionsIndex
+                    const rawIndexes = Array.isArray(answer.correctOptionsIndex)
+                        ? answer.correctOptionsIndex
+                        : (typeof answer.correctOptionsIndex === "number" ? [answer.correctOptionsIndex] : []);
+
+                    rawIndexes.forEach((idx) => {
+                        const num = Number(idx);
+                        if (Number.isFinite(num) && num >= 0 && num < q.optionElements.length) {
+                            targetIndexes.add(num);
+                        }
+                    });
+
+                    // Also match by correctOptions text
+                    const rawOptions = Array.isArray(answer.correctOptions)
+                        ? answer.correctOptions
+                        : (typeof answer.correctOptions === "string" ? [answer.correctOptions] : []);
+
+                    rawOptions.forEach((targetText) => {
+                        q.optionElements.forEach((opt, optIdx) => {
+                            if (CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(opt.text, targetText)) {
+                                targetIndexes.add(optIdx);
+                            }
+                        });
+                    });
+
+                    // HARD FILTER: Eliminate known wrong options for both single_choice and multi_select!
+                    const wrongOptions = [
+                        ...(q.memory && Array.isArray(q.memory.knownWrongOptions) ? q.memory.knownWrongOptions : []),
+                        ...(q.memory && Array.isArray(q.memory.wrongAttempts) && (q.type === "single_choice" || q.type === "mcq")
+                            ? q.memory.wrongAttempts.flatMap((w) => Array.isArray(w.options) ? w.options : [w.options])
+                            : []),
+                        ...(q.matchedPreviousQ && (q.matchedPreviousQ.status === "incorrect" || q.matchedPreviousQ.status === "unpassed_attempt") && (q.type === "single_choice" || q.type === "mcq") && Array.isArray(q.matchedPreviousQ.chosenOptions)
+                            ? q.matchedPreviousQ.chosenOptions
+                            : []),
+                    ];
+
+                    if (wrongOptions.length > 0) {
+                        if (q.type === "single_choice" || q.type === "mcq") {
+                            const chosenIdx = targetIndexes.size > 0 ? Array.from(targetIndexes)[0] : -1;
+                            const chosenText = chosenIdx >= 0 ? q.optionElements[chosenIdx]?.text : "";
+                            const isChosenWrong = chosenText && wrongOptions.some((w) =>
+                                CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, chosenText)
+                            );
+                            if (isChosenWrong || targetIndexes.size === 0) {
+                                // Find an alternative option that has NOT been marked wrong
+                                const safeIdx = q.optionElements.findIndex((opt) =>
+                                    !wrongOptions.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, opt.text))
+                                );
+                                if (safeIdx !== -1) {
+                                    logRunner("quiz_memory_avoided_wrong", {
+                                        ...summarizeItem(currentItem),
+                                        question: q.question,
+                                        avoidedWrong: chosenText,
+                                        selectedAlternative: q.optionElements[safeIdx].text,
+                                    }, { mode });
+                                    targetIndexes.clear();
+                                    targetIndexes.add(safeIdx);
+                                }
+                            }
+                        } else if (q.type === "multi_select") {
+                            // In multi_select, remove ANY targetIndex that matches a knownWrongOption!
+                            const indexesToRemove = [];
+                            targetIndexes.forEach((idx) => {
+                                const optText = q.optionElements[idx]?.text;
+                                if (optText && wrongOptions.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, optText))) {
+                                    indexesToRemove.push(idx);
+                                }
+                            });
+
+                            indexesToRemove.forEach((idx) => {
+                                logRunner("quiz_memory_avoided_wrong_multi", {
+                                    ...summarizeItem(currentItem),
+                                    question: q.question,
+                                    avoidedWrong: q.optionElements[idx]?.text,
+                                }, { mode });
+                                targetIndexes.delete(idx);
+                            });
+
+                            // If all selected options were wrong and targetIndexes became empty:
+                            if (targetIndexes.size === 0) {
+                                const safeIdx = q.optionElements.findIndex((opt) =>
+                                    !wrongOptions.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, opt.text))
+                                );
+                                if (safeIdx !== -1) {
+                                    targetIndexes.add(safeIdx);
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for previous failed combination in multi_select to prevent infinite loops!
+                    if (q.type === "multi_select") {
+                        const currentChosenTexts = Array.from(targetIndexes).map((idx) => q.optionElements[idx]?.text || "");
+                        const isPrevFailedCombination = (
+                            (q.matchedPreviousQ && q.matchedPreviousQ.status === "incorrect" &&
+                                CourseRunnerHelpers && CourseRunnerHelpers.isSameOptionCombination &&
+                                CourseRunnerHelpers.isSameOptionCombination(q.matchedPreviousQ.chosenOptions, currentChosenTexts)) ||
+                            (q.memory?.wrongAttempts || []).some((w) =>
+                                CourseRunnerHelpers && CourseRunnerHelpers.isSameOptionCombination &&
+                                CourseRunnerHelpers.isSameOptionCombination(w.options, currentChosenTexts)
+                            )
+                        );
+
+                        if (isPrevFailedCombination) {
+                            logRunnerWarn("quiz_loop_detected_altering_combination", {
+                                ...summarizeItem(currentItem),
+                                question: q.question,
+                            }, { mode });
+
+                            // Alter combination: find an untried safe option to add, or drop the last option
+                            const untriedIdx = q.optionElements.findIndex((opt, idx) =>
+                                !targetIndexes.has(idx) &&
+                                !wrongOptions.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, opt.text))
+                            );
+                            if (untriedIdx !== -1) {
+                                targetIndexes.add(untriedIdx);
+                            } else if (targetIndexes.size > 1) {
+                                const lastIdx = Array.from(targetIndexes).pop();
+                                targetIndexes.delete(lastIdx);
+                            }
+                        }
+                    }
+
+                    // Always enforce confirmed correct options in multi_select
+                    if (q.type === "multi_select" && q.memory && Array.isArray(q.memory.confirmedCorrectOptions) && q.memory.confirmedCorrectOptions.length > 0) {
+                        q.optionElements.forEach((opt, optIdx) => {
+                            if (q.memory.confirmedCorrectOptions.some((c) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(opt.text, c))) {
+                                targetIndexes.add(optIdx);
+                            }
+                        });
+                    }
+                }
+
+                // Apply to DOM
+                if (q.type === "multi_select") {
+                    q.optionElements.forEach((opt, optIdx) => {
+                        const shouldBeChecked = targetIndexes.has(optIdx);
+                        selectOptionInput(opt.input, shouldBeChecked);
+                        if (shouldBeChecked) filledCount++;
+                    });
+                } else {
+                    targetIndexes.forEach((idx) => {
+                        selectOptionInput(q.optionElements[idx].input, true);
+                        filledCount++;
+                    });
+                }
+
+                q.actualChosenIndexes = Array.from(targetIndexes);
+                q.actualChosenOptions = q.actualChosenIndexes.map((idx) => q.optionElements[idx]?.text || "");
+            } else if (q.type === "text" && q.inputElement) {
+                let content = typeof answer === "string"
+                    ? answer
+                    : (answer?.content || answer?.text || (Array.isArray(answer?.correctOptions) ? answer.correctOptions[0] : ""));
+                if (!content || (!q.isTitle && content.length < 80)) {
+                    content = generateFallbackTextAnswer(q.question, currentItem.title, q.isTitle);
+                }
+                await fillTextInput(q.inputElement, content);
+                filledCount++;
+                q.actualChosenOptions = [content];
+                await delay(350);
+            }
+        }
+
+        // Ensure all checkboxes (e.g. honor code agreement) are checked
+        const allCheckboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+        allCheckboxes.forEach((cb) => {
+            if (!cb.checked && !isHiddenControl(cb)) {
+                clickCheckbox(cb);
+            }
+        });
+
+        // Quality verification: check for any unanswered questions after filling
+        let stillUnanswered = questions.filter((q) => !validateQuestionElementAnswered(q));
+        if (stillUnanswered.length > 0) {
+            logRunnerWarn("quiz_autofilling_unanswered_after_ai", {
+                ...summarizeItem(currentItem),
+                unansweredCount: stillUnanswered.length,
+            }, { mode });
+
+            for (const q of stillUnanswered) {
+                if ((q.type === "single_choice" || q.type === "multi_select" || q.type === "mcq") && q.optionElements && q.optionElements.length) {
+                    const wrongOptions = [
+                        ...(q.memory && Array.isArray(q.memory.knownWrongOptions) ? q.memory.knownWrongOptions : []),
+                        ...(q.memory && Array.isArray(q.memory.wrongAttempts) && (q.type === "single_choice" || q.type === "mcq")
+                            ? q.memory.wrongAttempts.flatMap((w) => Array.isArray(w.options) ? w.options : [w.options])
+                            : []),
+                        ...(q.matchedPreviousQ && (q.matchedPreviousQ.status === "incorrect" || q.matchedPreviousQ.status === "unpassed_attempt") && (q.type === "single_choice" || q.type === "mcq") && Array.isArray(q.matchedPreviousQ.chosenOptions)
+                            ? q.matchedPreviousQ.chosenOptions
+                            : []),
+                    ];
+                    const safeIdx = q.optionElements.findIndex((opt) =>
+                        !wrongOptions.some((w) => CourseRunnerHelpers && CourseRunnerHelpers.isOptionMatching(w, opt.text))
+                    );
+                    const targetIdx = safeIdx !== -1 ? safeIdx : 0;
+                    selectOptionInput(q.optionElements[targetIdx].input, true);
+                    filledCount++;
+                    q.actualChosenIndexes = [targetIdx];
+                    q.actualChosenOptions = [q.optionElements[targetIdx].text];
+                } else if (q.type === "text" && q.inputElement) {
+                    const fallbackText = generateFallbackTextAnswer(q.question, currentItem.title, q.isTitle);
+                    await fillTextInput(q.inputElement, fallbackText);
+                    filledCount++;
+                    q.actualChosenOptions = [fallbackText];
+                    await delay(350);
+                }
+            }
+        }
+
+        // Final quality check
+        stillUnanswered = questions.filter((q) => !validateQuestionElementAnswered(q));
+        const allQuestionsAnswered = stillUnanswered.length === 0;
+
+        if (allQuestionsAnswered) {
+            logRunner("quiz_quality_gate_passed", {
+                ...summarizeItem(currentItem),
+                totalQuestions: questions.length,
+            }, { mode });
+        } else {
+            logRunnerWarn("quiz_quality_gate_failed", {
+                ...summarizeItem(currentItem),
+                totalQuestions: questions.length,
+                unansweredCount: stillUnanswered.length,
+            }, { mode });
+        }
+
+        logRunner("quiz_dom_answers_filled", {
+            ...summarizeItem(currentItem),
+            filledCount,
+            totalQuestions: questions.length,
+            allQuestionsAnswered,
+        }, { mode });
+
+        const submission = {
+            courseSlug,
+            itemPath: currentItem.path,
+            itemSlug: getItemSlug(currentItem.path),
+            timestamp: Date.now(),
+            questions: questions.map((q) => ({
+                prompt: q.question,
+                fingerprint: q.fingerprint,
+                type: q.type,
+                allOptions: q.options || [],
+                chosenIndexes: q.actualChosenIndexes || [],
+                chosenOptions: q.actualChosenOptions || [],
+            })),
+        };
+
+        try {
+            sessionStorage.setItem("autocoursera:lastSubmission", JSON.stringify(submission));
+        } catch (e) {}
+
+        return {
+            solved: allQuestionsAnswered && filledCount > 0,
+            submission,
+        };
     }
 
     function summarizeItem(item) {
@@ -1476,6 +4369,7 @@
 
     function buildQuizDomSnapshot(stage, item) {
         const startButton = findStartQuizButton();
+        const startModalButton = findStartAttemptModalConfirmButton();
         const submitButton = findActionButton(isSubmitActionLabel);
         const confirmButton = findConfirmSubmitButton();
         const nextButton = findNextItemButton();
@@ -1492,6 +4386,8 @@
             hasStartButton: Boolean(startButton),
             startLabel: startButton ? getButtonLabel(startButton) : "",
             startDisabled: startButton ? isButtonDisabled(startButton) : false,
+            hasStartModalButton: Boolean(startModalButton),
+            startModalLabel: startModalButton ? getButtonLabel(startModalButton) : "",
             hasSubmitButton: Boolean(submitButton),
             submitLabel: submitButton ? getButtonLabel(submitButton) : "",
             submitDisabled: submitButton ? isButtonDisabled(submitButton) : false,
@@ -1538,6 +4434,15 @@
             readyState: document.readyState,
             visibilityState: document.visibilityState,
         }, { mode: inferContextMode() });
+
+        if (/\/assignment-submission\/|\/exam\//i.test(location.pathname)) {
+            setTimeout(() => {
+                recordQuizResults({ title: document.title, path: location.pathname }, "page_load");
+            }, 1500);
+            setTimeout(() => {
+                recordQuizResults({ title: document.title, path: location.pathname }, "page_load_settled");
+            }, 4000);
+        }
 
         const previousLifecycle = readLifecycleMarker();
         if (previousLifecycle) {
@@ -1637,9 +4542,16 @@
                 continue;
             }
 
+            const gradePercent = extractGradePercentage(item.title);
+            const isRetryDueToLowScore = gradePercent !== null && gradePercent < cachedPassingThreshold;
+
             logRunner("quiz_scan_item", {
                 ...details,
-                decision: isUngradedAppItem(item) ? "start_app_item" : "start_quiz",
+                decision: isRetryDueToLowScore
+                    ? "retry_quiz"
+                    : isUngradedAppItem(item)
+                    ? "start_app_item"
+                    : "start_quiz",
             });
             return;
         }
@@ -1698,6 +4610,43 @@
 
     function getQuizResultDelaySeconds(quizResultSettleMs = QUIZ_RESULT_SETTLE_MS) {
         return Math.ceil(quizResultSettleMs / 1000);
+    }
+
+    function hasConfiguredAiKey(settings) {
+        return (
+            normalizeKeysForRunner(settings && settings.openaiKeys).length > 0 ||
+            normalizeKeysForRunner(settings && settings.groqKeys).length > 0 ||
+            normalizeKeysForRunner(settings && settings.key).length > 0 ||
+            Boolean(window.GeminiAI && window.GeminiAI.DEFAULT_API_KEY)
+        );
+    }
+
+    function hasConfiguredGroqKey(settings) {
+        return hasConfiguredAiKey(settings);
+    }
+
+    function normalizeKeysForRunner(value) {
+        const candidates = Array.isArray(value)
+            ? value
+            : String(value || "").split(/\r?\n|,/);
+        const seen = new Set();
+        const keys = [];
+
+        candidates.forEach((item) => {
+            const key = String(item || "").trim();
+            if (!key || seen.has(key)) {
+                return;
+            }
+
+            seen.add(key);
+            keys.push(key);
+        });
+
+        return keys;
+    }
+
+    function normalizeGroqKeysForRunner(value) {
+        return normalizeKeysForRunner(value);
     }
 
     function getAppItemStepDelaySeconds() {
