@@ -1119,7 +1119,7 @@
             quiz_solver_fill_ready: `AI đã fill đáp án (${details.answeredCount || 0} đáp án)`,
             quiz_dom_questions_found: `Tìm thấy ${details.count || 0} câu hỏi trên trang`,
             quiz_ai_request_start: `Đang gửi ${details.questionCount || 0} câu hỏi tới AI (APIZ)...`,
-            quiz_gemini_web_start: `Đang gửi ${details.questionCount || 0} câu hỏi sang tab Gemini Web...`,
+            quiz_chatgpt_web_start: `Đang hỏi ChatGPT ${details.responseMode === "fast" ? "nhanh" : "Pro (suy luận cao nhất)"}: ${details.unresolvedCount || details.questionCount || 0} câu hỏi; chờ phản hồi hoàn tất.`,
             quiz_ai_answers_received: `AI đã trả về ${details.answerCount || 0} đáp án`,
             quiz_dom_answers_filled: `Đã tự động điền ${details.filledCount || 0}/${details.totalQuestions || 0} câu hỏi`,
             quiz_dom_no_questions: "Không tìm thấy câu hỏi trong DOM",
@@ -1442,6 +1442,7 @@
         try {
             return validate(await solve(prompt, {}));
         } catch (error) {
+            if (/CHATGPT_|PRO_|NOT_LOGGED_IN|SEND_BUTTON|SEND_NOT_CONFIRMED/.test(error?.message || "")) throw error;
             onFallback(error);
             const captured = await capture();
             const screenshotUrls = Array.isArray(captured) ? captured.filter(Boolean) : (captured ? [captured] : []);

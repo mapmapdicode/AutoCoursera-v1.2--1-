@@ -27,13 +27,14 @@ chrome.tabs.onUpdated.addListener(async function (tabId, changeInfo, tab) {
 
     const fullRunKey = `fullRunState:${tabId}`;
     const quizRunKey = `quizRunState:${tabId}`;
-    chrome.storage.local.get([fullRunKey, quizRunKey], (result) => {
+    chrome.storage.local.get([fullRunKey, quizRunKey, "quiz"], (result) => {
         const fullRunState = result[fullRunKey];
         const quizRunState = result[quizRunKey];
 
         const urlPath = new URL(tab.url).pathname;
-        if (urlPath.endsWith("attempt") && !quizRunState?.active) {
-            sendTabMessage(tabId, "attempt");
+        if (result.quiz === true && urlPath.endsWith("attempt") && !quizRunState?.active && !fullRunState?.active &&
+            quizRunState?.status !== "paused" && fullRunState?.status !== "paused") {
+            sendTabMessage(tabId, {type: "solveChatGPTQuiz"});
         }
 
         if (fullRunState && fullRunState.active && fullRunState.status !== "paused") {
@@ -60,6 +61,10 @@ chrome.runtime.onInstalled.addListener(function () {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (["startChatGPTJob", "getChatGPTJob", "releaseChatGPTJob", "chatGPTJobResult", "openChatGPTTab"].includes(message?.type)) {
+        handleChatGPTMessage(message, sender).then(sendResponse, (error) => sendResponse({ok: false, error: error.message}));
+        return true;
+    }
     if (message && message.type === "getTabId") {
         sendResponse({ tabId: sender.tab ? sender.tab.id : null });
         return;
@@ -146,34 +151,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
-    if (message && message.type === "askGeminiWeb") {
-        (async () => {
-            try {
-                const callerTabId = sender.tab ? sender.tab.id : null;
-                const result = await handleAskGeminiWeb(message.prompt, message.options, callerTabId);
-                sendResponse(result);
-            } catch (err) {
-                console.error("[AutoCoursera][Background] askGeminiWeb error:", err);
-                sendResponse({
-                    ok: false,
-                    error: err.message || "Không thể lấy câu trả lời từ tab Gemini Web.",
-                });
-            }
-        })();
-        return true;
-    }
-
-    if (message && message.type === "openGeminiTab") {
-        (async () => {
-            try {
-                const tab = await getOrCreateGeminiTab({ activate: true });
-                sendResponse({ ok: true, tabId: tab.id });
-            } catch (err) {
-                sendResponse({ ok: false, error: err.message });
-            }
-        })();
-        return true;
-    }
 });
 
 function delayMs(ms) {
@@ -199,122 +176,130 @@ function waitForTabComplete(tabId, timeoutMs = 20000) {
     });
 }
 
-async function getOrCreateGeminiTab(options = {}) {
-    const tabs = await new Promise((resolve) => {
-        chrome.tabs.query({ url: "*://gemini.google.com/*" }, resolve);
-    });
-
-    if (tabs && tabs.length > 0) {
-        const tab = tabs[0];
-        if (options.activate) {
-            chrome.tabs.update(tab.id, { active: true });
-        }
-        return tab;
-    }
-
-    const newTab = await new Promise((resolve) => {
-        chrome.tabs.create(
-            {
-                url: "https://gemini.google.com/app",
-                active: options.activate !== false,
-            },
-            resolve
-        );
-    });
-
-    if (newTab && newTab.id) {
-        await waitForTabComplete(newTab.id, 20000);
-        await delayMs(2500); // Allow Gemini SPA scripts to hydrate
-    }
-
-    return newTab;
+// Session storage survives MV3 worker suspension. Each message below is short;
+// the content script owns the long-running UI interaction and reports completion.
+const chatgptJobStorage = chrome.storage.session || chrome.storage.local;
+let chatgptMutationQueue = Promise.resolve();
+const sessionGet = (keys) => new Promise((resolve) => chatgptJobStorage.get(keys, resolve));
+const sessionSet = (values) => new Promise((resolve) => chatgptJobStorage.set(values, resolve));
+const sessionRemove = (keys) => new Promise((resolve) => chatgptJobStorage.remove(keys, resolve));
+function serializeChatGPTMutation(action) {
+    const pending = chatgptMutationQueue.then(action);
+    chatgptMutationQueue = pending.catch(() => {});
+    return pending;
 }
-
-async function pingGeminiTab(tabId, maxRetries = 6) {
-    for (let i = 0; i < maxRetries; i++) {
-        try {
-            const res = await new Promise((resolve, reject) => {
-                chrome.tabs.sendMessage(tabId, { type: "PING_GEMINI" }, (response) => {
-                    if (chrome.runtime.lastError) {
-                        return reject(new Error(chrome.runtime.lastError.message));
-                    }
-                    resolve(response);
-                });
-            });
-
-            if (res && res.isReady) {
-                return res;
-            }
-        } catch (e) {
-            // Wait and retry
-            await delayMs(1000);
-        }
-    }
-    return null;
+function chatGPTTabMessage(tabId, message) {
+    return new Promise((resolve, reject) => chrome.tabs.sendMessage(tabId, message, (result) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else if (!result || result.ok === false) reject(new Error(result?.error || "CHATGPT_CONNECTION_LOST"));
+        else resolve(result);
+    }));
 }
-
-async function handleAskGeminiWeb(prompt, options = {}, callerTabId = null) {
-    if (!prompt) {
-        throw new Error("Prompt câu hỏi không được để trống.");
-    }
-
-    console.log("[AutoCoursera][Background] Preparing Gemini Web tab for query...");
-    const geminiTab = await getOrCreateGeminiTab({
-        activate: options && options.activateTab === true,
-    });
-
-    if (!geminiTab || !geminiTab.id) {
-        throw new Error("Không thể mở hoặc kết nối tới tab Gemini Web.");
-    }
-
-    const pingStatus = await pingGeminiTab(geminiTab.id, 7);
-    if (!pingStatus) {
-        throw new Error(
-            "Script cầu nối trên tab Gemini chưa sẵn sàng. Hãy đảm bảo tab https://gemini.google.com/app đã được tải xong."
-        );
-    }
-
-    if (pingStatus.loggedIn === false) {
-        // Activate tab so user can log in
-        chrome.tabs.update(geminiTab.id, { active: true });
-        throw new Error(
-            "Chưa đăng nhập Gemini: Vui lòng chuyển sang tab Gemini và đăng nhập tài khoản Google của bạn!"
-        );
-    }
-
-    console.log("[AutoCoursera][Background] Sending prompt to Gemini Web tab id:", geminiTab.id);
-
-    const result = await new Promise((resolve, reject) => {
-        chrome.tabs.sendMessage(
-            geminiTab.id,
-            {
-                type: "ASK_GEMINI",
-                prompt,
-                options: {
-                    timeoutMs: (options && options.timeoutMs) || 120000,
-                    screenshotUrls: options.screenshotUrls || [],
-                },
-            },
-            (response) => {
-                if (chrome.runtime.lastError) {
-                    return reject(new Error(chrome.runtime.lastError.message));
-                }
-                if (!response) {
-                    return reject(new Error("Không nhận được phản hồi từ tab Gemini."));
-                }
-                resolve(response);
-            }
-        );
-    });
-
-    // Optionally switch back to Coursera tab so user can see auto-filling
-    if (callerTabId && options && options.activateTab === true) {
-        try {
-            chrome.tabs.update(callerTabId, { active: true });
-        } catch (e) {
-            // Ignore switch back error
+async function getOrCreateChatGPTTab({activate = false, assignmentKey} = {}) {
+    const saved = (await sessionGet(["chatgptWebTab"])).chatgptWebTab;
+    if (saved?.id) {
+        const tab = await new Promise((resolve) => chrome.tabs.get(saved.id, (result) => {
+            if (chrome.runtime.lastError) resolve(null); else resolve(result);
+        }));
+        if (tab && new URL(tab.url).hostname === "chatgpt.com") {
+            if (assignmentKey !== undefined && saved.assignmentKey !== assignmentKey) {
+                const status = await chatGPTTabMessage(tab.id, {type: "PING_CHATGPT"});
+                if (status.busy || status.hasDraft) throw new Error("CHATGPT_BUSY: Tab có phản hồi hoặc bản nháp chưa hoàn tất.");
+                await new Promise((resolve) => chrome.tabs.update(tab.id, {url: "https://chatgpt.com/", active: activate}, resolve));
+                await waitForTabComplete(tab.id);
+                await sessionSet({chatgptWebTab: {id: tab.id, assignmentKey}});
+            } else if (activate) chrome.tabs.update(tab.id, {active: true});
+            return tab;
         }
     }
-
-    return result;
+    // A dedicated tab shares browser login but does not overwrite personal chats.
+    const tab = await new Promise((resolve, reject) => chrome.tabs.create({url: "https://chatgpt.com/", active: activate}, (result) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message)); else resolve(result);
+    }));
+    if (!tab?.id) throw new Error("CHATGPT_TAB_UNAVAILABLE");
+    await sessionSet({chatgptWebTab: {id: tab.id, assignmentKey: assignmentKey || ""}});
+    if (tab.status !== "complete") await waitForTabComplete(tab.id);
+    return tab;
+}
+async function dispatchChatGPTJob(job, prompt, options) {
+    try {
+        const tab = await getOrCreateChatGPTTab({assignmentKey: options.assignmentKey || ""});
+        let status;
+        for (let index = 0; index < 12; index++) {
+            try {status = await chatGPTTabMessage(tab.id, {type: "PING_CHATGPT"}); if (status.isReady) break;} catch (_) {}
+            await delayMs(500);
+        }
+        if (!status?.isReady) throw new Error("CHATGPT_BRIDGE_UNAVAILABLE: Reload extension rồi mở lại tab ChatGPT.");
+        if (!status.loggedIn) {
+            chrome.tabs.update(tab.id, {active: true});
+            throw new Error("NOT_LOGGED_IN: Đăng nhập ChatGPT Pro trong tab vừa mở rồi chạy lại.");
+        }
+        if (status.busy || status.hasDraft) throw new Error("CHATGPT_BUSY: Tab có phản hồi hoặc tin nhắn chưa gửi.");
+        await serializeChatGPTMutation(async () => {
+            const current = (await sessionGet([`chatgptJob:${job.requestId}`]))[`chatgptJob:${job.requestId}`];
+            if (!current || current.status !== "preparing") throw new Error("CHATGPT_CANCELLED");
+            job = {...current, chatTabId: tab.id, status: "running"};
+            await sessionSet({[`chatgptJob:${job.requestId}`]: job});
+        });
+        await chatGPTTabMessage(tab.id, {type: "START_CHATGPT_JOB", requestId: job.requestId, prompt,
+            options: {...options, timeoutMs: job.timeoutMs, reasoningEffort: options.mode === "fast" ? "min" : "max"}});
+    } catch (error) {
+        await serializeChatGPTMutation(async () => {
+            const key = `chatgptJob:${job.requestId}`;
+            const current = (await sessionGet([key]))[key];
+            if (current) await sessionSet({[key]: {...current, status: "failed", error: error.message}});
+        });
+    }
+}
+async function handleChatGPTMessage(message, sender) {
+    if (sender.id !== chrome.runtime.id) throw new Error("CHATGPT_ACCESS_DENIED");
+    if (message.type === "openChatGPTTab") {
+        const tab = await getOrCreateChatGPTTab({activate: true});
+        return {ok: true, tabId: tab.id};
+    }
+    if (message.type === "startChatGPTJob") {
+        if (!sender.tab || !/^https:\/\/(www\.)?coursera\.org\/learn\//.test(sender.tab.url || "")) throw new Error("CHATGPT_ACCESS_DENIED");
+        if (typeof message.prompt !== "string" || !message.prompt.trim()) throw new Error("EMPTY_PROMPT");
+        const options = {...message.options, mode: message.options?.mode === "fast" ? "fast" : "pro"};
+        const job = await serializeChatGPTMutation(async () => {
+            const activeId = (await sessionGet(["chatgptActiveJob"])).chatgptActiveJob;
+            const active = activeId ? (await sessionGet([`chatgptJob:${activeId}`]))[`chatgptJob:${activeId}`] : null;
+            if (active && ["preparing", "running"].includes(active.status) && active.expiresAt > Date.now()) throw new Error("CHATGPT_BUSY: Một bài khác đang chờ AI trả lời.");
+            if (activeId) await sessionRemove([`chatgptJob:${activeId}`, "chatgptActiveJob"]);
+            const requestId = crypto.randomUUID();
+            const timeoutMs = options.mode === "fast" ? 300000 : 1800000;
+            const result = {requestId, callerTabId: sender.tab.id, chatTabId: null, status: "preparing", createdAt: Date.now(),
+                timeoutMs, expiresAt: Date.now() + timeoutMs + 45000};
+            await sessionSet({chatgptActiveJob: requestId, [`chatgptJob:${requestId}`]: result});
+            return result;
+        });
+        void dispatchChatGPTJob(job, message.prompt, options);
+        return {ok: true, requestId: job.requestId};
+    }
+    return serializeChatGPTMutation(async () => {
+        const key = `chatgptJob:${message.requestId}`;
+        let job = (await sessionGet([key]))[key];
+        if (!job) throw new Error("CHATGPT_JOB_NOT_FOUND: Không tự gửi lại để tránh trùng câu hỏi.");
+        if (message.type === "chatGPTJobResult") {
+            if (sender.tab?.id !== job.chatTabId || !/^https:\/\/chatgpt\.com\//.test(sender.tab.url || "") || job.status !== "running") throw new Error("CHATGPT_ACCESS_DENIED");
+            const complete = message.ok === true && typeof message.text === "string" && Boolean(message.text.trim()) && Date.now() < job.expiresAt;
+            await sessionSet({[key]: {...job, status: complete ? "complete" : "failed", text: complete ? message.text : undefined,
+                error: complete ? undefined : message.error || "CHATGPT_RESPONSE_INCOMPLETE"}});
+            return {ok: true};
+        }
+        if (sender.tab?.id !== job.callerTabId) throw new Error("CHATGPT_ACCESS_DENIED");
+        if (message.type === "releaseChatGPTJob") {
+            if (["running", "preparing"].includes(job.status) && job.chatTabId) {
+                void chatGPTTabMessage(job.chatTabId, {type: "CANCEL_CHATGPT_JOB", requestId: job.requestId}).catch(() => {});
+            }
+            await sessionRemove([key]);
+            if ((await sessionGet(["chatgptActiveJob"])).chatgptActiveJob === job.requestId) await sessionRemove(["chatgptActiveJob"]);
+            return {ok: true};
+        }
+        if (Date.now() >= job.expiresAt || (job.status === "preparing" && Date.now() - job.createdAt > 45000)) {
+            job = {...job, status: "failed", text: undefined, error: "CHATGPT_TIMEOUT: AI chưa hoàn tất; không sử dụng đáp án một phần."};
+            await sessionSet({[key]: job});
+        }
+        return {ok: true, status: job.status, text: job.status === "complete" ? job.text : undefined, error: job.error};
+    });
 }

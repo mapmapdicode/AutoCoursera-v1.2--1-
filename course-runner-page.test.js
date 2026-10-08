@@ -10,7 +10,7 @@ test("quiz provider routes enabled autofill to Luna and preserves the primary mo
     for (const enabled of [false, true]) {
         const calls = [];
         class AI {
-            async readSettings() { return {aiMode: "gemini_web"}; }
+            async readSettings() { return {aiMode: "api"}; }
             async solveQuestions(prompt, options) { calls.push(["primary", prompt, options]); return []; }
             async solveQuestionsViaLuna(prompt, options) { calls.push(["luna", prompt, options]); return []; }
         }
@@ -19,7 +19,7 @@ test("quiz provider routes enabled autofill to Luna and preserves the primary mo
         vm.runInContext(source.slice(start, end) + "\nthis.provider = createQuizAnswerProvider;", context);
         const provider = await context.provider();
         assert.equal(provider.useLuna, enabled);
-        assert.equal(provider.isGeminiWeb, !enabled);
+        assert.equal(provider.isChatGPTWeb, false);
         await provider.solve("question", {screenshotUrl: "image"});
         assert.equal(calls[0][0], enabled ? "luna" : "primary");
         assert.equal(calls[0][2].screenshotUrl, "image");
@@ -43,6 +43,7 @@ test("Luna fills radio, checkbox and text answers; cancelled responses never cha
         ];
         const location = {pathname: "/learn/c/quiz/a/attempt"};
         class AI {
+            async readSettings() {return {aiMode: "api"};}
             async solveQuestionsViaLuna(prompt) {
                 if (cancellation === "toggle") enabled = false;
                 if (cancellation === "route") location.pathname = "/learn/c/quiz/b";

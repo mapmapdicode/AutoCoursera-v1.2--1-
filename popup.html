@@ -357,7 +357,7 @@
             <div class="setting-item">
                 <div class="setting-item-text">
                     <span class="title">Auto Quiz</span>
-                    <span class="text"><br> Require API Key</span>
+                    <span class="text"><br> Đăng nhập ChatGPT web hoặc cấu hình API</span>
                 </div>
                 <label class="toggle-switch">
                     <input type="checkbox" id="quizToggel">
@@ -374,7 +374,7 @@
                         <span class="slider"></span>
                     </label>
                 </div>
-                <p class="api-key-subtitle">Bật để lấy đáp án và tự điền bằng Luna. Tắt để dùng chế độ AI bên dưới. Không thay đổi cài đặt tự nộp bài.</p>
+                <p class="api-key-subtitle">Tùy chọn này chỉ áp dụng khi chọn API Key. Chế độ ChatGPT web luôn dùng tab đã đăng nhập.</p>
                 <div class="input-container">
                     <label for="luna-autofill-endpoint" class="api-key-subtitle">Endpoint Luna riêng</label>
                     <input type="url" id="luna-autofill-endpoint" placeholder="https://llm.vcoderlog.com/">
@@ -387,10 +387,10 @@
             <div class="api-key-section">
                 <label class="title-label">AI Mode (Phương thức giải Quiz)</label>
                 <div style="display: flex; gap: 8px; margin-top: 4px;">
-                    <label id="label-mode-gemini-web" style="flex: 1; padding: 8px; border: 2px solid #22c55e; border-radius: 8px; cursor: pointer; text-align: center; font-size: 0.78rem; background: #f0fdf4; transition: all 0.2s;">
-                        <input type="radio" name="aiModeRadio" id="mode-gemini-web" value="gemini_web" checked style="display: none;">
-                        <strong style="color: #15803d;">🌟 Gemini Web Tab</strong><br>
-                        <span style="font-size: 0.7rem; color: #16a34a;">Free 100% / Tự mở tab</span>
+                    <label id="label-mode-chatgpt-web" style="flex: 1; padding: 8px; border: 2px solid #22c55e; border-radius: 8px; cursor: pointer; text-align: center; font-size: 0.78rem; background: #f0fdf4; transition: all 0.2s;">
+                        <input type="radio" name="aiModeRadio" id="mode-chatgpt-web" value="chatgpt_web" checked style="display: none;">
+                        <strong style="color: #15803d;">ChatGPT Web / Pro</strong><br>
+                        <span style="font-size: 0.7rem; color: #16a34a;">Dùng tài khoản đã đăng nhập</span>
                     </label>
                     <label id="label-mode-api" style="flex: 1; padding: 8px; border: 2px solid #cbd5e1; border-radius: 8px; cursor: pointer; text-align: center; font-size: 0.78rem; background: #f8fafc; transition: all 0.2s;">
                         <input type="radio" name="aiModeRadio" id="mode-api" value="api" style="display: none;">
@@ -399,11 +399,12 @@
                     </label>
                 </div>
 
-                <div id="gemini-web-panel" style="margin-top: 6px; padding: 10px; background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; font-size: 0.75rem; color: #166534; line-height: 1.45;">
-                    <p style="margin: 0 0 6px 0;"><strong>Cách hoạt động:</strong> Extension tự động mở tab <code>gemini.google.com</code>, copy câu hỏi sang hỏi Gemini, đợi câu trả lời rồi tự động điền vào Coursera.</p>
-                    <p style="margin: 0 0 8px 0; color: #374151;">✨ <em>Chỉ cần đăng nhập Google trên trình duyệt là dùng được ngay!</em></p>
-                    <button id="open-gemini-tab" class="secondary-button" style="width: 100%; padding: 7px; font-size: 0.75rem; background-color: #16a34a; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500;">
-                        🌐 Mở / Kiểm tra tab Gemini Web
+                <div id="chatgpt-web-panel" style="margin-top: 6px; padding: 10px; background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; font-size: 0.75rem; color: #166534; line-height: 1.45;">
+                    <p style="margin: 0 0 6px 0;">Extension dùng tab <code>chatgpt.com</code> riêng trong cùng trình duyệt. Đăng nhập tài khoản Pro của bạn ở đó.</p>
+                    <p style="margin: 0 0 6px 0;"><strong>Unlimited attempts:</strong> chế độ nhanh. <strong>3 attempts / every 24 hours:</strong> Pro, suy luận cao nhất. Nếu chưa rõ giới hạn, dùng Pro.</p>
+                    <p style="margin: 0 0 8px 0; color: #374151;">Chỉ điền khi ChatGPT trả lời hoàn tất và đủ đáp án. Không chọn được Pro hoặc có lỗi sẽ tạm dừng. Mức suy luận cao không bảo đảm mọi đáp án đều đúng.</p>
+                    <button id="open-chatgpt-tab" class="secondary-button" style="width: 100%; padding: 7px; font-size: 0.75rem; background-color: #16a34a; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500;">
+                        Mở tab ChatGPT / Đăng nhập Pro
                     </button>
                 </div>
             </div>
@@ -420,8 +421,6 @@
                     <select id="model-select">
                         <option value="gh/gpt-5.6-luna" selected>ChatGPT GPT-5.6 Luna (vcoderlog - Recommended)</option>
                         <option value="gpt-6-luna">ChatGPT GPT-6 Luna (APIZ)</option>
-                        <option value="gemini-flash-latest">Google Gemini Flash (Latest Free)</option>
-                        <option value="gemini-2.5-flash-lite">Google Gemini 2.5 Flash-Lite</option>
                     </select>
                 </div>
             </div>
@@ -464,7 +463,7 @@
         </div>
 
         <footer>
-            <p>&copy; 2025 NEW Auto Coursera 1.2</p>
+            <p>&copy; 2026 NEW Auto Coursera 1.3 — ChatGPT Web</p>
             <p>Made by ErrorxCode with ❤️</p>
         </footer>
 

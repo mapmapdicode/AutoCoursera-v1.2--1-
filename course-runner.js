@@ -117,6 +117,15 @@
             return;
         }
 
+        if (message.type === "solveChatGPTQuiz") {
+            sendResponse({ok: true, started: true});
+            solveQuizDirectlyFromDom({title: document.title, path: location.pathname}, "manual")
+                .then((result) => {
+                    if (!result?.solved) logRunnerWarn("quiz_ai_error", {message: result?.error || "AI chưa cung cấp đủ đáp án hợp lệ; đã dừng."});
+                })
+                .catch((error) => logRunnerWarn("quiz_ai_error", {message: error.message}));
+            return;
+        }
         if (message === "attempt" || message.type === "attempt") {
             solveQuizDirectlyFromDom({ title: document.title, path: location.pathname }, "manual")
                 .then((result) => sendResponse({ ok: Boolean(result && (result.solved || result === true)) }))
@@ -673,6 +682,7 @@
 
     async function waitForQuizSubmission(mode, currentItem, timeoutMs) {
         const startedAt = Date.now();
+        let aiWaitMs = 0;
         const quizResultSettleMs = await getQuizResultSettleMs();
         let attemptRelayed = false;
         let attemptRelayedAt = 0;
@@ -703,7 +713,7 @@
         } catch (e) {}
         let viewFeedbackVisited = false;
 
-        while (Date.now() - startedAt < timeoutMs) {
+        while (Date.now() - startedAt - aiWaitMs < timeoutMs) {
             const state = await getRunState(mode);
             if (!state || !state.active) {
                 return { kind: "done" };
@@ -740,6 +750,7 @@
             }
 
             const loadingText = getMainContentText();
+            globalThis.window?.ChatGPTPolicy?.currentPolicy();
             const loadingState = resolveQuizPageLoadState({
                 readyState: document.readyState,
                 text: loadingText,
@@ -1333,8 +1344,13 @@
 
                 // 1. Direct DOM Quiz Solver
                 let directSolved = false;
+                const aiStartedAt = Date.now();
                 try {
                     const solveResult = await solveQuizDirectlyFromDom(currentItem, mode);
+                    if (solveResult?.pause) {
+                        await updateRunState(mode, {active: false, status: "paused", processing: false, lastStatus: solveResult.error});
+                        return {kind: "paused", reason: solveResult.error};
+                    }
                     if (solveResult) {
                         directSolved = Boolean(solveResult.solved || solveResult === true);
                         if (solveResult.submission) {
@@ -1345,7 +1361,15 @@
                         }
                     }
                 } catch (domErr) {
+                    if (globalThis.window?.ChatGPTPolicy && (await new window.GeminiAI().readSettings()).aiMode === "chatgpt_web") {
+                        await updateRunState(mode, {active: false, status: "paused", processing: false, lastStatus: `Đã dừng: ${domErr.message}`});
+                        logRunnerWarn("quiz_ai_error", {...summarizeItem(currentItem), message: domErr.message}, {mode});
+                        return {kind: "paused", reason: domErr.message};
+                    }
                     console.warn("Direct DOM quiz solver error:", domErr);
+                } finally {
+                    // Navigation/submission timeouts must not expire while Pro is thinking.
+                    aiWaitMs += Date.now() - aiStartedAt;
                 }
 
                 if (directSolved) {
@@ -1623,6 +1647,7 @@
     }
 
     async function handleQuizOutcome(mode, outcome, item) {
+        if (outcome.kind === "paused") return;
         if (outcome.kind === "failed") {
             await skipItem(mode, item, outcome.reason);
             return;
@@ -3453,11 +3478,6 @@
                 q.actualChosenIndexes = targetIndexes;
                 q.actualChosenOptions = targetIndexes.map((index) => q.optionElements[index].text);
                 await delay(150);
-            } else if (q.type === "text" && q.inputElement) {
-                const fallbackText = generateFallbackTextAnswer(q.question, currentItem.title, q.isTitle);
-                await fillTextInput(q.inputElement, fallbackText);
-                q.actualChosenOptions = [fallbackText];
-                await delay(350);
             }
         }
 
@@ -3984,20 +4004,25 @@
         if (!AIClass) return null;
         const ai = new AIClass();
         const settings = await storageGet(["lunaAutofillEnabled"]);
-        const useLuna = settings.lunaAutofillEnabled === true;
-        const mainSettings = useLuna ? {} : await ai.readSettings();
+        const mainSettings = await ai.readSettings();
+        const isChatGPTWeb = mainSettings.aiMode !== "api";
+        const useLuna = !isChatGPTWeb && settings.lunaAutofillEnabled === true;
+        const chatgptPolicy = globalThis.window?.ChatGPTPolicy?.currentPolicy() || {kind: "unknown", mode: "pro"};
         return {
             useLuna,
-            isGeminiWeb: !useLuna && mainSettings.aiMode === "gemini_web",
+            isChatGPTWeb,
+            chatgptPolicy,
             solve: (prompt, options) => useLuna
                 ? ai.solveQuestionsViaLuna(prompt, options)
-                : ai.solveQuestions(prompt, { ...options, purpose: "primary_quiz" }),
+                : ai.solveQuestions(prompt, { ...options, purpose: "primary_quiz", chatgptPolicy }),
         };
     }
 
     async function solveQuizDirectlyFromDom(currentItem, mode) {
         const solvePath = normalizePath(location.pathname);
-        let usedLuna = false;
+        const provider = await createQuizAnswerProvider();
+        if (!provider) return false;
+        const usedLuna = provider.useLuna;
         // Automatically scroll through all containers & unlock trapped overflow so all questions are loaded
         await ensureAllQuizContentScrolledAndLoaded(mode);
 
@@ -4093,6 +4118,10 @@
             }
         });
 
+        // Limited attempts must receive a fresh Pro review, including remembered answers.
+        if (provider.isChatGPTWeb && provider.chatgptPolicy.kind !== "unlimited") {
+            questions.forEach((q) => {delete q.resolvedTargetIndexes;});
+        }
         const memoryResolvedCount = questions.filter((q) => q.resolvedTargetIndexes).length;
         if (memoryResolvedCount > 0) {
             logRunner("quiz_memory_prefilled", {
@@ -4174,7 +4203,6 @@
                 }, { mode });
             }
 
-            const provider = await createQuizAnswerProvider();
             if (!provider) {
                 logRunnerWarn("quiz_error", {
                     ...summarizeItem(currentItem),
@@ -4183,8 +4211,7 @@
                 return false;
             }
 
-            usedLuna = provider.useLuna;
-            const isGeminiWeb = provider.isGeminiWeb;
+            const isChatGPTWeb = provider.isChatGPTWeb;
             if (usedLuna) {
                 logRunner("quiz_luna_autofill_start", {
                     ...summarizeItem(currentItem), model: "gh/gpt-5.6-luna",
@@ -4192,11 +4219,12 @@
                 }, { mode });
             }
 
-            if (isGeminiWeb) {
-                logRunner("quiz_gemini_web_start", {
+            if (isChatGPTWeb) {
+                logRunner("quiz_chatgpt_web_start", {
                     ...summarizeItem(currentItem),
                     questionCount: questions.length,
                     unresolvedCount: questionsNeedingAi.length,
+                    responseMode: provider.chatgptPolicy.kind === "unlimited" ? "fast" : "pro",
                 }, { mode });
             } else {
                 logRunner("quiz_ai_request_start", {
@@ -4259,6 +4287,7 @@
                     ...summarizeItem(currentItem),
                     error: err && err.message,
                 });
+                if (provider.isChatGPTWeb) throw err;
                 return false;
             }
 
@@ -4275,6 +4304,18 @@
             }, { mode });
         }
 
+        // Validate the entire web response before touching any Coursera answer.
+        if (provider.isChatGPTWeb) {
+            const invalid = questions.some((q, index) => {
+                if (q.resolvedTargetIndexes) return false;
+                const answer = answers[index];
+                if (q.type === "text") return typeof answer?.content !== "string" || !answer.content.trim() || (!q.isTitle && answer.content.trim().length < 80);
+                const indexes = answer?.correctOptionsIndex;
+                return !Array.isArray(indexes) || !indexes.length || indexes.some((value) => !Number.isInteger(value) || value < 0 || value >= (q.optionElements?.length || 0)) ||
+                    ((q.type === "single_choice" || q.type === "mcq") && new Set(indexes).size !== 1);
+            });
+            if (invalid) return {solved: false, pause: true, error: "CHATGPT_INVALID_ANSWER: AI trả thiếu hoặc sai định dạng đáp án; đã dừng trước khi điền."};
+        }
         let filledCount = 0;
         for (let qIndex = 0; qIndex < questions.length; qIndex++) {
             if (normalizePath(location.pathname) !== solvePath) return false;
@@ -4410,6 +4451,7 @@
                     ? answer
                     : (answer?.content || answer?.text || (Array.isArray(answer?.correctOptions) ? answer.correctOptions[0] : ""));
                 if (!content || (!q.isTitle && content.length < 80)) {
+                    if (provider.isChatGPTWeb) continue;
                     content = generateFallbackTextAnswer(q.question, currentItem.title, q.isTitle);
                 }
                 await fillTextInput(q.inputElement, content);
@@ -4439,6 +4481,7 @@
                     q.actualChosenIndexes = targetIndexes;
                     q.actualChosenOptions = targetIndexes.map((index) => q.optionElements[index].text);
                 } else if (q.type === "text" && q.inputElement) {
+                    if (provider.isChatGPTWeb) continue;
                     const fallbackText = generateFallbackTextAnswer(q.question, currentItem.title, q.isTitle);
                     await fillTextInput(q.inputElement, fallbackText);
                     filledCount++;
@@ -4495,6 +4538,8 @@
         return {
             solved: allQuestionsAnswered && filledCount > 0,
             submission,
+            pause: provider.isChatGPTWeb && !allQuestionsAnswered,
+            error: !allQuestionsAnswered ? "AI chưa cung cấp đủ đáp án hợp lệ; đã dừng." : undefined,
         };
     }
 

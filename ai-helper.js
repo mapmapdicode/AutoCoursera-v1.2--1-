@@ -1,5 +1,5 @@
 /**
- * APIZ / ChatGPT Luna (OpenAI-compatible)-backed AI helper.
+ * Signed-in ChatGPT web helper, with an optional OpenAI-compatible API mode.
  *
  * The class name stays GeminiAI because the legacy obfuscated content script
  * instantiates window.GeminiAI directly.
@@ -25,62 +25,49 @@ class GeminiAI {
             return response;
         }
         const settings = await this.readSettings();
-        const mode = options.aiMode || settings.aiMode;
+        const mode = options.aiMode === "api" ? "api" : (options.aiMode ? "chatgpt_web" : settings.aiMode);
 
-        if (mode === "gemini_web") {
-            try {
-                return await this.generateResponseViaGeminiWeb(prompt, options);
-            } catch (webErr) {
-                logAiEvent("gemini_web_error_fallback", { error: webErr.message });
-                if (settings.apiKeys && settings.apiKeys.length > 0 && !settings.apiKeys[0].startsWith("AIzaSy")) {
-                    console.warn("[AutoCoursera][AI] Gemini Web tab failed, falling back to API:", webErr.message);
-                    return await this.generateResponseViaApi(prompt, options, settings);
-                }
-                throw webErr;
-            }
+        if (mode === "chatgpt_web") {
+            return await this.generateResponseViaChatGPTWeb(prompt, options);
         }
 
         return await this.generateResponseViaApi(prompt, options, settings);
     }
 
-    async generateResponseViaGeminiWeb(prompt, options = {}) {
-        logAiEvent("gemini_web_request_start", { promptLength: prompt.length });
-
-        return new Promise((resolve, reject) => {
+    async generateResponseViaChatGPTWeb(prompt, options = {}) {
+        const policyApi = globalThis.ChatGPTPolicy || (typeof require === "function" ? require("./chatgpt-policy") : null);
+        const policy = options.chatgptPolicy || policyApi?.currentPolicy() || {kind: "unknown"};
+        // Only proven unlimited attempts may take the fast route.
+        const fast = policy.kind === "unlimited";
+        const timeoutMs = fast ? 300000 : 1800000;
+        const requestOptions = {mode: fast ? "fast" : "pro", reasoningEffort: fast ? "min" : "max",
+            timeoutMs, assignmentKey: policy.assignmentKey || "", screenshotUrls: options.screenshotUrls ||
+                (options.screenshotUrl || options.imageUrl ? [options.screenshotUrl || options.imageUrl] : [])};
+        const send = (message) => new Promise((resolve, reject) => {
             if (!globalThis.chrome || !chrome.runtime || typeof chrome.runtime.sendMessage !== "function") {
-                return reject(new Error("chrome.runtime.sendMessage không khả dụng để kết nối tab Gemini."));
+                return reject(new Error("Không thể kết nối tab ChatGPT từ extension."));
             }
-
-            chrome.runtime.sendMessage(
-                {
-                    type: "askGeminiWeb",
-                    prompt,
-                    options: {
-                        timeoutMs: options.timeoutMs || 120000,
-                        activateTab: options.activateTab,
-                        screenshotUrls: options.screenshotUrls || (options.screenshotUrl || options.imageUrl ? [options.screenshotUrl || options.imageUrl] : []),
-                    },
-                },
-                (response) => {
-                    if (chrome.runtime.lastError) {
-                        const errMsg = chrome.runtime.lastError.message || "";
-                        logAiEvent("gemini_web_error", { message: errMsg });
-                        return reject(new Error(`Lỗi kết nối tab Gemini Web: ${errMsg}`));
-                    }
-
-                    if (!response || !response.ok) {
-                        const errMsg = (response && response.error) || "Không nhận được phản hồi từ tab Gemini Web.";
-                        logAiEvent("gemini_web_failed", { error: errMsg });
-                        return reject(new Error(errMsg));
-                    }
-
-                    logAiEvent("gemini_web_response_received", {
-                        responseLength: (response.text || "").length,
-                    });
-                    resolve(response.text);
-                }
-            );
+            chrome.runtime.sendMessage(message, (response) => {
+                if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                if (!response?.ok) return reject(new Error(response?.error || "CHATGPT_CONNECTION_LOST: Không nhận được phản hồi từ ChatGPT."));
+                resolve(response);
+            });
         });
+        const webPrompt = options.systemPrompt ? `${options.systemPrompt}\n\n${prompt}` : prompt;
+        const started = await send({type: "startChatGPTJob", prompt: webPrompt, options: requestOptions});
+        if (typeof started.requestId !== "string" || !started.requestId) throw new Error("CHATGPT_INVALID_ACK: Không có mã tác vụ; đã dừng.");
+        const deadline = Date.now() + timeoutMs + 60000;
+        try {
+            while (Date.now() < deadline) {
+                const job = await send({type: "getChatGPTJob", requestId: started.requestId});
+                if (job.status === "complete") return job.text;
+                if (job.status === "failed") throw new Error(job.error || "CHATGPT_JOB_FAILED");
+                await new Promise((resolve) => setTimeout(resolve, 1500));
+            }
+            throw new Error("CHATGPT_TIMEOUT: Hết thời gian chờ; đã dừng, không dùng phản hồi chưa hoàn tất.");
+        } finally {
+            await send({type: "releaseChatGPTJob", requestId: started.requestId}).catch(() => {});
+        }
     }
 
     async generateResponseViaApi(prompt, options = {}, settings = null) {
@@ -185,9 +172,10 @@ class GeminiAI {
     }
 
     async solveQuestions(questionsPrompt, options = {}) {
-        // The legacy content script calls this method directly. Keep its answer
-        // requests on the dedicated Luna route when the same toggle is enabled.
-        if (!options.purpose) {
+        // Legacy callers also obey web mode; Luna is an explicit API-only option.
+        const responseMode = options.aiMode || (await this.readSettings()).aiMode;
+        const useChatGPTWeb = responseMode !== "api" && options.purpose !== "luna_autofill";
+        if (!options.purpose && !useChatGPTWeb) {
             const settings = await this.readLunaAutofillSettings();
             if (settings.enabled) options = { ...options, purpose: "luna_autofill" };
         }
@@ -198,7 +186,7 @@ class GeminiAI {
         try {
             responseText = await this.generateResponse(fullPrompt, options);
         } catch (error) {
-            if (hasImage) {
+            if (hasImage && !useChatGPTWeb) {
                 console.warn(
                     `[AutoCoursera][AI] Vision request failed (${error.message}). Retrying with text-only prompt...`
                 );
@@ -214,8 +202,30 @@ class GeminiAI {
         }
 
         try {
+            if (useChatGPTWeb) {
+                const parsed = JSON.parse(stripJsonCodeFence(responseText));
+                const answers = Array.isArray(parsed) ? parsed : parsed?.answers;
+                if (!Array.isArray(answers) || !answers.length) throw new Error("Missing answers");
+                let supplied;
+                try {supplied = JSON.parse(questionsPrompt);} catch (_) {}
+                const questions = Array.isArray(supplied) ? supplied : supplied?.questions;
+                if (questions?.length && answers.length !== questions.length) throw new Error("Incomplete answers");
+                answers.forEach((answer, index) => {
+                    if (!answer || typeof answer !== "object") throw new Error("Invalid answer");
+                    const question = questions?.[index];
+                    const indexes = answer.correctOptionsIndex;
+                    const hasChoices = Array.isArray(indexes) && indexes.length > 0 && indexes.every((value) => Number.isInteger(value) && value >= 0);
+                    const hasText = typeof answer.content === "string" && Boolean(answer.content.trim());
+                    if (question?.type === "text") {if (!hasText) throw new Error("Missing text answer");}
+                    else if (!hasChoices && !hasText) throw new Error("Missing answer");
+                    if (hasChoices && question?.options?.length && indexes.some((value) => value >= question.options.length)) throw new Error("Invalid option index");
+                    if (["single_choice", "mcq"].includes(question?.type) && (!hasChoices || new Set(indexes).size !== 1)) throw new Error("Invalid single choice");
+                });
+                return answers;
+            }
             return GeminiAI.parseAnswerResponse(responseText);
         } catch (error) {
+            if (useChatGPTWeb) throw new Error(`CHATGPT_INVALID_ANSWER: ${error.message}; không dùng đáp án một phần.`);
             console.error("Failed to parse AI response:", responseText);
             throw new Error("AI returned invalid JSON.");
         }
@@ -345,15 +355,11 @@ class GeminiAI {
                 ? storageResult.openaiKeyCursor
                 : storageResult.groqKeyCursor;
 
-        const hasCustomApiKeys = Boolean(
-            (storageResult.openaiKeys && storageResult.openaiKeys.length) ||
-            (storageResult.groqKeys && storageResult.groqKeys.length) ||
-            storageResult.key
-        );
-
-        const aiMode = storageResult.aiMode
-            ? storageResult.aiMode
-            : (hasCustomApiKeys ? "api" : "gemini_web");
+        const legacyGemini = /^gemini/i.test(storageResult.openaiModel || storageResult.model || "") ||
+            /generativelanguage\.googleapis\.com/i.test(storageResult.apiEndpoint || "") ||
+            GeminiAI.normalizeKeys(rawKeys).some((key) => key.startsWith("AIzaSy"));
+        const aiMode = storageResult.aiMode === "api" && !legacyGemini ? "api" : "chatgpt_web";
+        if (storageResult.aiMode !== aiMode) await storageSet(this.storage, {aiMode});
 
         return {
             aiMode,

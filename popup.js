@@ -39,13 +39,14 @@ document.addEventListener("DOMContentLoaded", () => {
         lunaAutofillToggle: document.getElementById("luna-autofill-toggle"),
         lunaEndpointInput: document.getElementById("luna-autofill-endpoint"),
         lunaKeysInput: document.getElementById("luna-autofill-keys"),
-        modeGeminiWebRadio: document.getElementById("mode-gemini-web"),
+        modeChatGPTWebRadio: document.getElementById("mode-chatgpt-web"),
         modeApiRadio: document.getElementById("mode-api"),
-        labelModeGeminiWeb: document.getElementById("label-mode-gemini-web"),
+        labelModeChatGPTWeb: document.getElementById("label-mode-chatgpt-web"),
         labelModeApi: document.getElementById("label-mode-api"),
-        geminiWebPanel: document.getElementById("gemini-web-panel"),
+        chatgptWebPanel: document.getElementById("chatgpt-web-panel"),
+        lunaAutofillSection: document.getElementById("luna-autofill-section"),
         apiKeySection: document.getElementById("api-key-section"),
-        openGeminiTabButton: document.getElementById("open-gemini-tab"),
+        openChatGPTTabButton: document.getElementById("open-chatgpt-tab"),
         apiEndpointInput: document.getElementById("api-endpoint"),
         keyInput: document.getElementById("key"),
         modelSelect: document.getElementById("model-select"),
@@ -96,31 +97,28 @@ async function initializePopup(elements) {
         selectedModel = DEFAULT_MODEL;
     }
 
-    const hasCustomApiKeys = Boolean(
-        (settings.openaiKeys && settings.openaiKeys.length) ||
-        (settings.groqKeys && settings.groqKeys.length) ||
-        settings.key
-    );
-    const initialMode = settings.aiMode || (hasCustomApiKeys ? "api" : "gemini_web");
+    const legacyGemini = /^gemini/i.test(settings.openaiModel || settings.model || "") ||
+        /generativelanguage\.googleapis\.com/i.test(settings.apiEndpoint || "") || normalizeKeys(rawKeys).some((key) => key.startsWith("AIzaSy"));
+    const initialMode = settings.aiMode === "api" && !legacyGemini ? "api" : "chatgpt_web";
+    if (settings.aiMode !== initialMode) await storageSet({aiMode: initialMode});
     setAiModeUI(elements, initialMode);
 
-    if (elements.modeGeminiWebRadio) {
-        elements.modeGeminiWebRadio.addEventListener("change", () => {
-            setAiModeUI(elements, "gemini_web");
+    if (elements.modeChatGPTWebRadio) {
+        elements.modeChatGPTWebRadio.addEventListener("change", async () => {
+            await storageSet({aiMode: "chatgpt_web"});
+            setAiModeUI(elements, "chatgpt_web");
         });
     }
     if (elements.modeApiRadio) {
-        elements.modeApiRadio.addEventListener("change", () => {
+        elements.modeApiRadio.addEventListener("change", async () => {
+            await storageSet({aiMode: "api"});
             setAiModeUI(elements, "api");
         });
     }
-    if (elements.openGeminiTabButton) {
-        elements.openGeminiTabButton.addEventListener("click", () => {
-            chrome.runtime.sendMessage({ type: "openGeminiTab" }, () => {
-                if (chrome.runtime.lastError) {
-                    chrome.tabs.create({ url: "https://gemini.google.com/app" });
-                }
-                setRunStatus(elements, "Đã mở tab Gemini Web.");
+    if (elements.openChatGPTTabButton) {
+        elements.openChatGPTTabButton.addEventListener("click", () => {
+            chrome.runtime.sendMessage({ type: "openChatGPTTab" }, (result) => {
+                setRunStatus(elements, chrome.runtime.lastError?.message || result?.error || "Đã mở tab ChatGPT. Đăng nhập Pro trong tab này nếu cần.");
             });
         });
     }
@@ -160,7 +158,7 @@ async function initializePopup(elements) {
     });
 
     elements.autoQuiz.addEventListener("click", async () => {
-        await sendMessageToTab(activeTab.id, "attempt");
+        await sendMessageToTab(activeTab.id, {type: "solveChatGPTQuiz"});
         setRunStatus(elements, "Quiz solve action sent.");
     });
 
@@ -236,8 +234,8 @@ async function initializePopup(elements) {
     });
 
     elements.saveButton.addEventListener("click", async () => {
-        const aiMode = elements.modeGeminiWebRadio && elements.modeGeminiWebRadio.checked
-            ? "gemini_web"
+        const aiMode = elements.modeChatGPTWebRadio && elements.modeChatGPTWebRadio.checked
+            ? "chatgpt_web"
             : "api";
         const apiEndpoint = normalizeEndpoint(elements.apiEndpointInput.value);
         elements.apiEndpointInput.value = apiEndpoint;
@@ -377,38 +375,39 @@ async function refreshRunLogs(elements, tabId) {
 }
 
 function setAiModeUI(elements, mode) {
-    const isGeminiWeb = mode === "gemini_web";
-    if (elements.modeGeminiWebRadio) elements.modeGeminiWebRadio.checked = isGeminiWeb;
-    if (elements.modeApiRadio) elements.modeApiRadio.checked = !isGeminiWeb;
+    const isChatGPTWeb = mode !== "api";
+    if (elements.modeChatGPTWebRadio) elements.modeChatGPTWebRadio.checked = isChatGPTWeb;
+    if (elements.modeApiRadio) elements.modeApiRadio.checked = !isChatGPTWeb;
+    if (elements.lunaAutofillSection) elements.lunaAutofillSection.style.display = isChatGPTWeb ? "none" : "block";
 
-    if (elements.geminiWebPanel) {
-        elements.geminiWebPanel.style.display = isGeminiWeb ? "block" : "none";
+    if (elements.chatgptWebPanel) {
+        elements.chatgptWebPanel.style.display = isChatGPTWeb ? "block" : "none";
     }
     if (elements.apiKeySection) {
-        elements.apiKeySection.style.display = isGeminiWeb ? "none" : "block";
+        elements.apiKeySection.style.display = isChatGPTWeb ? "none" : "block";
     }
 
-    if (elements.labelModeGeminiWeb) {
-        elements.labelModeGeminiWeb.style.borderColor = isGeminiWeb ? "#22c55e" : "#cbd5e1";
-        elements.labelModeGeminiWeb.style.backgroundColor = isGeminiWeb ? "#f0fdf4" : "#ffffff";
-        const strong = elements.labelModeGeminiWeb.querySelector("strong");
-        if (strong) strong.style.color = isGeminiWeb ? "#15803d" : "#64748b";
+    if (elements.labelModeChatGPTWeb) {
+        elements.labelModeChatGPTWeb.style.borderColor = isChatGPTWeb ? "#22c55e" : "#cbd5e1";
+        elements.labelModeChatGPTWeb.style.backgroundColor = isChatGPTWeb ? "#f0fdf4" : "#ffffff";
+        const strong = elements.labelModeChatGPTWeb.querySelector("strong");
+        if (strong) strong.style.color = isChatGPTWeb ? "#15803d" : "#64748b";
     }
     if (elements.labelModeApi) {
-        elements.labelModeApi.style.borderColor = !isGeminiWeb ? "#dc2626" : "#cbd5e1";
-        elements.labelModeApi.style.backgroundColor = !isGeminiWeb ? "#fef2f2" : "#ffffff";
+        elements.labelModeApi.style.borderColor = !isChatGPTWeb ? "#dc2626" : "#cbd5e1";
+        elements.labelModeApi.style.backgroundColor = !isChatGPTWeb ? "#fef2f2" : "#ffffff";
         const strong = elements.labelModeApi.querySelector("strong");
-        if (strong) strong.style.color = !isGeminiWeb ? "#b91c1c" : "#64748b";
+        if (strong) strong.style.color = !isChatGPTWeb ? "#b91c1c" : "#64748b";
     }
 
     updateKeyStatus(elements, elements.keyInput ? elements.keyInput.value : []);
 }
 
 function updateKeyStatus(elements, keys) {
-    const isGeminiWeb = elements.modeGeminiWebRadio && elements.modeGeminiWebRadio.checked;
-    if (isGeminiWeb) {
+    const isChatGPTWeb = elements.modeChatGPTWebRadio && elements.modeChatGPTWebRadio.checked;
+    if (isChatGPTWeb) {
         if (elements.keyStatus) {
-            elements.keyStatus.textContent = "🌟 Đang dùng Gemini Web Tab: Tự động mở tab hỏi đáp án, 100% miễn phí.";
+            elements.keyStatus.textContent = "ChatGPT web: bài không giới hạn dùng nhanh; bài giới hạn/không rõ dùng Pro cao nhất và chờ hoàn tất.";
             elements.keyStatus.style.color = "#16a34a";
         }
         return;

@@ -25,7 +25,7 @@ test("Luna autofill uses its own endpoint, key, model and cursor despite Gemini 
     calls.push({url, options});
     return createJsonResponse(200, {choices: [{message: {content: '[{"correctOptionsIndex":[1]}]'}}]});
   }});
-  ai.generateResponseViaGeminiWeb = async () => { throw new Error("must not use Gemini"); };
+  ai.generateResponseViaChatGPTWeb = async () => { throw new Error("must not use web for explicit Luna request"); };
   const answers = await ai.solveQuestionsViaLuna('[{"prompt":"Example"}]', { aiMode: "gemini_web", model: "wrong-model" });
   assert.deepEqual(answers, [{correctOptionsIndex: [1]}]);
   assert.equal(calls[0].url, "https://api.apiz.vn/v1/chat/completions");
@@ -54,21 +54,22 @@ test("turning Luna off during an API request discards the response", async () =>
 });
 
 test("legacy Auto Quiz also honors the Luna toggle without changing other AI calls", async () => {
-  const storage = createStorage({lunaAutofillEnabled: true, aiMode: "gemini_web", lunaAutofillKeys: ["sk-luna"]});
+  const storage = createStorage({lunaAutofillEnabled: true, aiMode: "api", lunaAutofillKeys: ["sk-luna"]});
   let calls = 0;
   const ai = new GeminiAI("", "", {storage: storage.api, fetch: async () => {
     calls++;
     return createJsonResponse(200, {choices: [{message: {content: '[{"correctOptionsIndex":[0]}]'}}]});
   }});
-  ai.generateResponseViaGeminiWeb = async () => "normal Gemini reply";
   await ai.solveQuestions("[]");
   assert.equal(calls, 1);
-  assert.equal(await ai.generateResponse("Navigation / feedback"), "normal Gemini reply");
-  assert.equal(calls, 1);
+  await ai.generateResponse("Navigation / feedback");
+  assert.equal(calls, 2);
 });
 
 function createStorage(initial = {}) {
-  const storage = { ...initial };
+  // These legacy tests exercise the optional API path explicitly. Web is now
+  // the default; its migration and routing are covered in ai-helper-chatgpt.test.
+  const storage = { aiMode: "api", ...initial };
   return {
     data: storage,
     api: {
@@ -449,16 +450,18 @@ test("solveQuestions automatically falls back to text-only if image is rejected 
   assert.deepEqual(result[0].correctOptionsIndex, [1]);
 });
 
-test("solveQuestions in gemini_web mode sends askGeminiWeb message and parses response", async () => {
+test("legacy Gemini settings send ChatGPT jobs with the previous feedback and parse a completed response", async () => {
   const originalChrome = globalThis.chrome;
   let sentMessage = null;
 
   globalThis.chrome = {
     runtime: {
       sendMessage(msg, callback) {
-        sentMessage = msg;
+        if (msg.type === "startChatGPTJob") {sentMessage = msg; callback({ok: true, requestId: "job"}); return;}
+        if (msg.type === "releaseChatGPTJob") {callback({ok: true}); return;}
         callback({
           ok: true,
+          status: "complete",
           text: "```json\n{\"answers\":[{\"correctOptionsIndex\":[2],\"correctOptions\":[\"Answer C\"],\"content\":\"\"}]}\n```",
         });
       },
@@ -488,7 +491,7 @@ test("solveQuestions in gemini_web mode sends askGeminiWeb message and parses re
       })
     );
 
-    assert.equal(sentMessage.type, "askGeminiWeb");
+    assert.equal(sentMessage.type, "startChatGPTJob");
     assert.ok(sentMessage.prompt.includes("Rubric: missing impact on people"));
     assert.ok(sentMessage.prompt.includes("Previously submitted essay"));
     assert.ok(sentMessage.prompt.includes("POPIT impact analysis scenario"));
@@ -502,7 +505,7 @@ test("solveQuestions in gemini_web mode sends askGeminiWeb message and parses re
   }
 });
 
-test("solveQuestions falls back to API when gemini_web fails and valid API keys are present", async () => {
+test("legacy Gemini settings pause on ChatGPT login failure even with saved API keys", async () => {
   const originalChrome = globalThis.chrome;
   let webCallAttempted = false;
   let apiCallAttempted = false;
@@ -510,11 +513,11 @@ test("solveQuestions falls back to API when gemini_web fails and valid API keys 
   globalThis.chrome = {
     runtime: {
       sendMessage(msg, callback) {
-        if (msg.type === "askGeminiWeb") {
+        if (msg.type === "startChatGPTJob") {
           webCallAttempted = true;
           callback({
             ok: false,
-            error: "NOT_LOGGED_IN: Chưa đăng nhập Google",
+            error: "NOT_LOGGED_IN: Chưa đăng nhập ChatGPT",
           });
         }
       },
@@ -545,10 +548,9 @@ test("solveQuestions falls back to API when gemini_web fails and valid API keys 
       },
     });
 
-    const result = await ai.solveQuestions(JSON.stringify([{ question: "Fallback test" }]));
+    await assert.rejects(ai.solveQuestions(JSON.stringify([{ question: "Fallback test" }])), /NOT_LOGGED_IN/);
     assert.ok(webCallAttempted);
-    assert.ok(apiCallAttempted);
-    assert.deepEqual(result[0].correctOptionsIndex, [0]);
+    assert.equal(apiCallAttempted, false);
   } finally {
     globalThis.chrome = originalChrome;
   }
