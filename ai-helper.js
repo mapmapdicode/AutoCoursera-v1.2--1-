@@ -14,6 +14,16 @@ class GeminiAI {
     }
 
     async generateResponse(prompt, options = {}) {
+        if (options.purpose === "luna_autofill") {
+            const settings = await this.readLunaAutofillSettings();
+            if (!settings.enabled) throw new Error("Tự điền đáp án qua Luna đang tắt.");
+            const response = await this.generateResponseViaApi(prompt, {
+                ...options, aiMode: "api", endpoint: settings.apiEndpoint, model: settings.model,
+            }, settings);
+            const latest = await this.readLunaAutofillSettings();
+            if (!latest.enabled) throw new Error("Tự điền đáp án qua Luna đã tắt; bỏ qua phản hồi API.");
+            return response;
+        }
         const settings = await this.readSettings();
         const mode = options.aiMode || settings.aiMode;
 
@@ -126,7 +136,7 @@ class GeminiAI {
 
                     if (isRateLimitResponse(response, body)) {
                         if (keys.length > 1) {
-                            await this.persistKeyCursor((keyIndex + 1) % keys.length);
+                            await this.persistKeyCursor((keyIndex + 1) % keys.length, activeSettings);
                             logAiEvent("key_rotated", {
                                 fromKeyIndex: keyIndex,
                                 toKeyIndex: (keyIndex + 1) % keys.length,
@@ -145,7 +155,7 @@ class GeminiAI {
                     throw lastError;
                 }
 
-                await this.persistKeyCursor(keyIndex);
+                await this.persistKeyCursor(keyIndex, activeSettings);
                 const resultText = getCompletionContent(body);
                 if (!resultText) {
                     throw new Error("No content found in AI response.");
@@ -175,6 +185,12 @@ class GeminiAI {
     }
 
     async solveQuestions(questionsPrompt, options = {}) {
+        // The legacy content script calls this method directly. Keep its answer
+        // requests on the dedicated Luna route when the same toggle is enabled.
+        if (!options.purpose) {
+            const settings = await this.readLunaAutofillSettings();
+            if (settings.enabled) options = { ...options, purpose: "luna_autofill" };
+        }
         const hasImage = Boolean(options && (options.screenshotUrls?.length || options.screenshotUrl || options.imageUrl));
         const fullPrompt = buildCourseraQuizPrompt(questionsPrompt, hasImage);
         let responseText;
@@ -203,6 +219,26 @@ class GeminiAI {
             console.error("Failed to parse AI response:", responseText);
             throw new Error("AI returned invalid JSON.");
         }
+    }
+
+    async solveQuestionsViaLuna(questionsPrompt, options = {}) {
+        return this.solveQuestions(questionsPrompt, { ...options, purpose: "luna_autofill" });
+    }
+
+    async readLunaAutofillSettings() {
+        const settings = await storageGet(this.storage, [
+            "lunaAutofillEnabled", "lunaAutofillEndpoint", "lunaAutofillKeys", "lunaAutofillKeyCursor",
+        ]);
+        const keys = GeminiAI.normalizeKeys(settings.lunaAutofillKeys);
+        return {
+            enabled: settings.lunaAutofillEnabled === true,
+            aiMode: "api",
+            apiEndpoint: normalizeEndpoint(settings.lunaAutofillEndpoint || GeminiAI.DEFAULT_API_ENDPOINT),
+            apiKeys: keys.length ? keys : [GeminiAI.DEFAULT_API_KEY],
+            model: GeminiAI.DEFAULT_CHATGPT_MODEL,
+            keyCursor: settings.lunaAutofillKeyCursor,
+            cursorStorageKey: "lunaAutofillKeyCursor",
+        };
     }
 
     async decideActionFromScreenshot(screenshotUrl, context = {}) {
@@ -335,7 +371,11 @@ class GeminiAI {
         return this.readSettings();
     }
 
-    async persistKeyCursor(cursor) {
+    async persistKeyCursor(cursor, settings = {}) {
+        if (settings.cursorStorageKey === "lunaAutofillKeyCursor") {
+            await storageSet(this.storage, { lunaAutofillKeyCursor: cursor });
+            return;
+        }
         await storageSet(this.storage, {
             openaiKeyCursor: cursor,
             groqKeyCursor: cursor,

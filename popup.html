@@ -201,6 +201,8 @@
         }
 
         #key,
+        #luna-autofill-keys,
+        #luna-autofill-endpoint,
         #api-endpoint,
         #quiz-result-settle-seconds {
             padding: 8px 12px;
@@ -211,7 +213,7 @@
             background-color: #f8fafc;
         }
 
-        #key {
+        #key, #luna-autofill-keys {
             min-height: 92px;
             resize: vertical;
         }
@@ -226,6 +228,8 @@
         }
 
         #key:focus,
+        #luna-autofill-keys:focus,
+        #luna-autofill-endpoint:focus,
         #api-endpoint:focus,
         #model-select:focus,
         #quiz-result-settle-seconds:focus {
@@ -362,6 +366,24 @@
             </div>
 
             <!-- AI Mode Selection -->
+            <div class="api-key-section" id="luna-autofill-section">
+                <div class="toggle-container">
+                    <label class="title-label" for="luna-autofill-toggle">Tự điền đáp án qua Luna</label>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="luna-autofill-toggle" aria-label="Tự điền đáp án qua Luna">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <p class="api-key-subtitle">Bật để lấy đáp án và tự điền bằng Luna. Tắt để dùng chế độ AI bên dưới. Không thay đổi cài đặt tự nộp bài.</p>
+                <div class="input-container">
+                    <label for="luna-autofill-endpoint" class="api-key-subtitle">Endpoint Luna riêng</label>
+                    <input type="url" id="luna-autofill-endpoint" placeholder="https://llm.vcoderlog.com/">
+                    <label for="luna-autofill-keys" class="api-key-subtitle">API key Luna riêng</label>
+                    <textarea id="luna-autofill-keys" spellcheck="false" placeholder="Mỗi key một dòng. Để trống dùng key Luna tích hợp."></textarea>
+                    <span class="api-key-subtitle">Model: gh/gpt-5.6-luna. Công tắc lưu ngay; nhấn Save để lưu thay đổi endpoint và key.</span>
+                </div>
+            </div>
+
             <div class="api-key-section">
                 <label class="title-label">AI Mode (Phương thức giải Quiz)</label>
                 <div style="display: flex; gap: 8px; margin-top: 4px;">

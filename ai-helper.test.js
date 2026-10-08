@@ -3,6 +3,70 @@ const assert = require("node:assert/strict");
 
 const GeminiAI = require("./ai-helper");
 
+test("Luna autofill is opt-in and does not call the API when disabled", async () => {
+  for (const initial of [{}, { lunaAutofillEnabled: false }]) {
+    let calls = 0;
+    const storage = createStorage(initial);
+    const ai = new GeminiAI("", "", { storage: storage.api, fetch: async () => { calls++; } });
+    await assert.rejects(ai.solveQuestionsViaLuna("[]"), /tắt/i);
+    assert.equal(calls, 0);
+  }
+});
+
+test("Luna autofill uses its own endpoint, key, model and cursor despite Gemini mode", async () => {
+  const storage = createStorage({
+    aiMode: "gemini_web", apiEndpoint: "https://api.openai.com/v1/chat/completions",
+    openaiKeys: ["sk-main"], openaiModel: "another-model", openaiKeyCursor: 3,
+    lunaAutofillEnabled: true, lunaAutofillEndpoint: "https://api.apiz.vn/",
+    lunaAutofillKeys: ["sk-autofill"], lunaAutofillKeyCursor: 0,
+  });
+  const calls = [];
+  const ai = new GeminiAI("", "", { storage: storage.api, fetch: async (url, options) => {
+    calls.push({url, options});
+    return createJsonResponse(200, {choices: [{message: {content: '[{"correctOptionsIndex":[1]}]'}}]});
+  }});
+  ai.generateResponseViaGeminiWeb = async () => { throw new Error("must not use Gemini"); };
+  const answers = await ai.solveQuestionsViaLuna('[{"prompt":"Example"}]', { aiMode: "gemini_web", model: "wrong-model" });
+  assert.deepEqual(answers, [{correctOptionsIndex: [1]}]);
+  assert.equal(calls[0].url, "https://api.apiz.vn/v1/chat/completions");
+  assert.equal(calls[0].options.headers.Authorization, "Bearer sk-autofill");
+  assert.equal(JSON.parse(calls[0].options.body).model, "gh/gpt-5.6-luna");
+  assert.equal(storage.data.openaiKeyCursor, 3);
+  assert.equal(storage.data.lunaAutofillKeyCursor, 0);
+});
+
+test("Luna autofill defaults use the existing Luna service independently of main keys", async () => {
+  const storage = createStorage({lunaAutofillEnabled: true, openaiKeys: ["sk-main"]});
+  const ai = new GeminiAI("", "", {storage: storage.api});
+  const settings = await ai.readLunaAutofillSettings();
+  assert.equal(settings.apiEndpoint, GeminiAI.DEFAULT_API_ENDPOINT);
+  assert.deepEqual(settings.apiKeys, [GeminiAI.DEFAULT_API_KEY]);
+  assert.equal(settings.model, "gh/gpt-5.6-luna");
+});
+
+test("turning Luna off during an API request discards the response", async () => {
+  const storage = createStorage({lunaAutofillEnabled: true});
+  const ai = new GeminiAI("", "", {storage: storage.api, fetch: async () => {
+    storage.data.lunaAutofillEnabled = false;
+    return createJsonResponse(200, {choices: [{message: {content: '[{"correctOptionsIndex":[0]}]'}}]});
+  }});
+  await assert.rejects(ai.solveQuestionsViaLuna("[]"), /đã tắt/i);
+});
+
+test("legacy Auto Quiz also honors the Luna toggle without changing other AI calls", async () => {
+  const storage = createStorage({lunaAutofillEnabled: true, aiMode: "gemini_web", lunaAutofillKeys: ["sk-luna"]});
+  let calls = 0;
+  const ai = new GeminiAI("", "", {storage: storage.api, fetch: async () => {
+    calls++;
+    return createJsonResponse(200, {choices: [{message: {content: '[{"correctOptionsIndex":[0]}]'}}]});
+  }});
+  ai.generateResponseViaGeminiWeb = async () => "normal Gemini reply";
+  await ai.solveQuestions("[]");
+  assert.equal(calls, 1);
+  assert.equal(await ai.generateResponse("Navigation / feedback"), "normal Gemini reply");
+  assert.equal(calls, 1);
+});
+
 function createStorage(initial = {}) {
   const storage = { ...initial };
   return {

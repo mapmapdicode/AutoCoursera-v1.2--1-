@@ -1,6 +1,9 @@
 const SETTINGS_KEYS = [
     "aiMode",
     "quiz",
+    "lunaAutofillEnabled",
+    "lunaAutofillEndpoint",
+    "lunaAutofillKeys",
     "key",
     "model",
     "apiEndpoint",
@@ -33,6 +36,9 @@ document.addEventListener("DOMContentLoaded", () => {
         makeQuizAll: document.getElementById("makeQuizAll"),
         pauseRun: document.getElementById("pauseRun"),
         quizToggle: document.getElementById("quizToggel"),
+        lunaAutofillToggle: document.getElementById("luna-autofill-toggle"),
+        lunaEndpointInput: document.getElementById("luna-autofill-endpoint"),
+        lunaKeysInput: document.getElementById("luna-autofill-keys"),
         modeGeminiWebRadio: document.getElementById("mode-gemini-web"),
         modeApiRadio: document.getElementById("mode-api"),
         labelModeGeminiWeb: document.getElementById("label-mode-gemini-web"),
@@ -66,6 +72,7 @@ async function initializePopup(elements) {
     const activeTab = await getActiveTab();
 
     elements.quizToggle.checked = Boolean(settings.quiz);
+    initializeLunaAutofill(elements, settings);
     let endpoint = settings.apiEndpoint || DEFAULT_ENDPOINT;
     if (/generativelanguage\.googleapis\.com/i.test(endpoint)) {
         endpoint = DEFAULT_ENDPOINT;
@@ -254,6 +261,7 @@ async function initializePopup(elements) {
         }
 
         await storageSet({
+            ...readLunaAutofillForm(elements),
             aiMode,
             apiEndpoint,
             openaiKeys: apiKeys,
@@ -301,6 +309,31 @@ async function initializePopup(elements) {
 
     await refreshRunStatus(elements, activeTab.id);
     await refreshRunLogs(elements, activeTab.id);
+}
+
+function readLunaAutofillForm(elements) {
+    return {
+        lunaAutofillEnabled: elements.lunaAutofillToggle.checked,
+        lunaAutofillEndpoint: normalizeEndpoint(elements.lunaEndpointInput.value),
+        lunaAutofillKeys: normalizeKeys(elements.lunaKeysInput.value),
+    };
+}
+
+function initializeLunaAutofill(elements, settings) {
+    elements.lunaAutofillToggle.checked = settings.lunaAutofillEnabled === true;
+    elements.lunaEndpointInput.value = settings.lunaAutofillEndpoint || DEFAULT_ENDPOINT;
+    elements.lunaKeysInput.value = normalizeKeys(settings.lunaAutofillKeys || []).join("\n");
+    elements.lunaAutofillToggle.addEventListener("change", async () => {
+        try {
+            await storageSet(readLunaAutofillForm(elements));
+            setRunStatus(elements, elements.lunaAutofillToggle.checked
+                ? "Đã bật tự điền đáp án qua Luna."
+                : "Đã tắt tự điền qua Luna; dùng chế độ AI hiện tại.");
+        } catch (error) {
+            elements.lunaAutofillToggle.checked = !elements.lunaAutofillToggle.checked;
+            setRunStatus(elements, `Không lưu được cài đặt Luna: ${error.message}`);
+        }
+    });
 }
 
 function getQuizResultSettleSeconds(value) {

@@ -19,8 +19,32 @@ test("option feedback interprets selection state rather than the total question 
   assert.equal(classifyOptionFeedback("Nice work. That's correct.", true), "correct");
   assert.equal(classifyOptionFeedback("Try again. Not quite.", true), "incorrect");
   assert.equal(classifyOptionFeedback("Try again. Not quite.", false), "correct");
-  assert.equal(classifyOptionFeedback("Nice work. That's correct.", false), "incorrect");
+  assert.equal(classifyOptionFeedback("Nice work. That's correct.", false), "unknown");
   assert.equal(classifyOptionFeedback("This should not be selected", true), "incorrect");
+  assert.equal(classifyOptionFeedback(
+    "Try again. A company website only gives public-facing information. Correct answer: Business goals.", true
+  ), "incorrect");
+});
+
+test("failed checkbox combinations do not erase individually confirmed answers", () => {
+  const { collectKnownWrongOptions, filterConfirmedOptions, resolveConfirmedOptionIndexes } = require("./course-runner-helpers.js");
+  const memory = { confirmedCorrectOptions: ["Cost", "Stakeholders"], knownWrongOptions: [],
+    wrongAttempts: [{ options: ["Cost", "Stakeholders", "Threats"] }] };
+  assert.deepEqual(filterConfirmedOptions(memory, null, "multi_select"), ["Cost", "Stakeholders"]);
+  assert.deepEqual(filterConfirmedOptions(memory, null, "single_choice"), []);
+  assert.deepEqual(collectKnownWrongOptions(memory, { status: "incorrect", chosenOptions: ["Cost", "Stakeholders", "Threats"] }, "multi_select"), []);
+  assert.deepEqual(collectKnownWrongOptions({ knownWrongOptions: ["Threats"] },
+    { status: "incorrect", chosenOptions: ["Cost", "Threats"], specificWrongOptions: ["Cost"] }, "multi_select"), ["Threats", "Cost"]);
+  assert.deepEqual(resolveConfirmedOptionIndexes(["Cost", "Threats", "Stakeholders"], memory, "multi_select"), []);
+  assert.deepEqual(resolveConfirmedOptionIndexes(["Cost", "Threats", "Stakeholders"],
+    { confirmedCorrectOptions: ["Cost", "Stakeholders"], confirmedCompleteSet: true }, "multi_select"), [0, 2]);
+  assert.deepEqual(resolveConfirmedOptionIndexes(["A", "B", "C"], { confirmedCorrectOptions: ["B"] }, "single_choice"), [1]);
+  assert.deepEqual(collectKnownWrongOptions({ confirmedCorrectOptions: ["Business goals"] },
+    { status: "unpassed_attempt", chosenOptions: ["Business goals"] }, "single_choice"), []);
+  assert.deepEqual(filterConfirmedOptions({ confirmedCorrectOptions: ["Business goals"] },
+    { status: "unpassed_attempt", chosenOptions: ["Business goals"] }, "single_choice"), ["Business goals"]);
+  assert.deepEqual(filterConfirmedOptions({ confirmedCorrectOptions: ["A", "B"], knownWrongOptions: ["B"] },
+    { status: "incorrect", chosenOptions: ["A"] }, "single_choice"), []);
 });
 
 test("full review text is sent in order without losing any content", async () => {
@@ -37,6 +61,16 @@ test("full review text is sent in order without losing any content", async () =>
   assert.equal(parts.join(""), text);
 });
 
+test("oversized feedback is rejected before a long Gemini send loop", async () => {
+  const { sendFullFeedback } = require("./course-runner-helpers.js");
+  let sendCount = 0;
+  await assert.rejects(
+    sendFullFeedback({ text: "feedback ".repeat(2000), send: async () => { sendCount++; } }),
+    /vượt giới hạn gửi an toàn/
+  );
+  assert.equal(sendCount, 0);
+});
+
 test("feedback transmission failure prevents completion of the feedback step", async () => {
   const { sendFullFeedback } = require("./course-runner-helpers.js");
   let sent = 0;
@@ -49,11 +83,11 @@ test("feedback transmission failure prevents completion of the feedback step", a
 
 test("resume transition waits for minimum delay and stable fully loaded content", () => {
   const { resolveAssignmentTransition } = require("./course-runner-helpers.js");
-  const state = { elapsedMs: 9000, stableForMs: 3500, readyState: "complete", text: "Questions loaded" };
+  const state = { elapsedMs: 9000, stableForMs: 3500, readyState: "complete", text: "Question and answer content has loaded completely." };
   assert.equal(resolveAssignmentTransition({ ...state, elapsedMs: 1000 }), "wait");
   assert.equal(resolveAssignmentTransition({ ...state, readyState: "interactive" }), "wait");
   assert.equal(resolveAssignmentTransition({ ...state, stableForMs: 1000 }), "wait");
-  assert.equal(resolveAssignmentTransition({ ...state, text: "" }), "wait");
+  assert.equal(resolveAssignmentTransition({ ...state, text: "Loading" }), "wait");
   assert.equal(resolveAssignmentTransition(state), "ready");
   assert.equal(resolveAssignmentTransition({ ...state, text: "", elapsedMs: 45000 }), "timeout");
 });
@@ -123,6 +157,8 @@ test("blank quiz pages wait for loading and time out without being treated as re
   assert.equal(resolveQuizPageLoadState({ readyState: "complete", text: "  ", elapsedMs: 5000 }), "wait");
   assert.equal(resolveQuizPageLoadState({ readyState: "complete", text: "", elapsedMs: 30000 }), "timeout");
   assert.equal(resolveQuizPageLoadState({ readyState: "complete", text: "Ready to start the Activity?", elapsedMs: 1000 }), "ready");
+  assert.equal(resolveQuizPageLoadState({ readyState: "complete", text: "[\\\\", elapsedMs: 1000 }), "wait");
+  assert.equal(resolveQuizPageLoadState({ readyState: "interactive", text: "This is a sufficiently long shell that should still wait", elapsedMs: 1000 }), "wait");
 });
 
 test("retry context survives storage round trip with full feedback and earlier attempts", () => {
@@ -160,6 +196,7 @@ const {
   isSubmitActionLabel,
   isUngradedAppItem,
   matchesItemPath,
+  normalizeQuizRetryCount,
   normalizeQuizResultSettleSeconds,
   normalizePath,
   pickFirstIncomplete,
@@ -213,6 +250,15 @@ test("normalizeQuizResultSettleSeconds defaults and clamps invalid values", () =
   assert.equal(normalizeQuizResultSettleSeconds("0"), 1);
   assert.equal(normalizeQuizResultSettleSeconds("200"), 120);
   assert.equal(normalizeQuizResultSettleSeconds("abc"), 4);
+});
+
+test("normalizeQuizRetryCount caps persisted retry settings", () => {
+  assert.equal(normalizeQuizRetryCount(undefined), 2);
+  assert.equal(normalizeQuizRetryCount("invalid"), 2);
+  assert.equal(normalizeQuizRetryCount(-1), 2);
+  assert.equal(normalizeQuizRetryCount(2.8), 2);
+  assert.equal(normalizeQuizRetryCount(5), 5);
+  assert.equal(normalizeQuizRetryCount(1000000), 5);
 });
 
 test("buildCourseMaterialsUrl encodes the slug for the Coursera API", () => {

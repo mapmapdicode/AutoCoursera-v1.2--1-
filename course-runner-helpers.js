@@ -89,6 +89,16 @@
         return Math.min(120, Math.max(1, Math.round(parsed)));
     }
 
+    function normalizeQuizRetryCount(value, fallback = 2) {
+        const parsed = Number(value);
+        const parsedFallback = Number(fallback);
+        const safeFallback = Number.isFinite(parsedFallback)
+            ? Math.max(0, Math.min(5, Math.floor(parsedFallback)))
+            : 2;
+        if (!Number.isFinite(parsed) || parsed < 0) return safeFallback;
+        return Math.max(0, Math.min(5, Math.floor(parsed)));
+    }
+
     function buildCourseMaterialsUrl(slug) {
         return `/api/ondemandcoursematerials.v2/?q=slug&slug=${encodeURIComponent(slug)}&includes=modules`;
     }
@@ -1126,6 +1136,8 @@
             quiz_feedback_inspected: `Đã lưu lại toàn bộ nội dung/gợi ý phản hồi của khung feedback (${details.questionCount || 0} câu)`,
             quiz_feedback_back_clicked: "Quay lại màn hình tổng kết bài quiz",
             quiz_attempt_locked: `Bài quiz bị khóa lượt làm (24h/hết lượt thử): ${details.reason || ""}`.trim(),
+            quiz_luna_autofill_start: `Luna đang lấy đáp án để tự điền (${details.unresolvedCount || 0} câu)`,
+            quiz_luna_autofill_cancelled: "Đã tắt tự điền qua Luna; bỏ qua đáp án đang chờ",
             quiz_scroll_range_unlocked: "Đã tự động scroll toàn bộ trang & mở khóa vùng cuộn để đọc đầy đủ nội dung câu hỏi",
             quiz_assignment_context_found: "Đã trích xuất hướng dẫn/ngữ cảnh bài tập để gửi kèm AI",
             quiz_click_start: "Nhấn Start quiz",
@@ -1332,16 +1344,72 @@
     function classifyOptionFeedback(text, selected) {
         const value = String(text || "");
         if (/should not be selected|incorrect option/i.test(value)) return "incorrect";
+        // Question-level explanations often say "Try again ... Correct answer: X".
+        // The negative verdict belongs to the selected choice; don't let the later
+        // answer-reveal phrase relabel that same choice as correct.
+        if (/try again|not quite|incorrect answer|wrong answer|not correct/i.test(value)) {
+            return selected ? "incorrect" : "correct";
+        }
         if (/should be selected|correct answer\s*:/i.test(value)) return "correct";
-        if (/nice work|that's correct|that’s correct/i.test(value)) return selected ? "correct" : "incorrect";
-        if (/try again|not quite/i.test(value)) return selected ? "incorrect" : "correct";
+        if (/nice work|that's correct|that’s correct/i.test(value)) return selected ? "correct" : "unknown";
         return "unknown";
+    }
+
+    function collectKnownWrongOptions(memory, previousQuestion, questionType) {
+        const knownWrong = memory && Array.isArray(memory.knownWrongOptions)
+            ? [...memory.knownWrongOptions]
+            : [];
+        if (previousQuestion && Array.isArray(previousQuestion.specificWrongOptions)) {
+            knownWrong.push(...previousQuestion.specificWrongOptions);
+        }
+        // A zero-point checkbox combination proves that the combination failed,
+        // not that every member option was wrong.
+        if (questionType === "single_choice" || questionType === "mcq") {
+            if (Array.isArray(memory?.wrongAttempts)) {
+                memory.wrongAttempts.forEach((attempt) => {
+                    knownWrong.push(...(Array.isArray(attempt.options) ? attempt.options : [attempt.options]));
+                });
+            }
+            if (previousQuestion && previousQuestion.status === "incorrect") {
+                knownWrong.push(...(previousQuestion.chosenOptions || []));
+            }
+        }
+        return [...new Map(knownWrong.filter(Boolean).map((option) => [String(option).trim().toLowerCase(), option])).values()];
+    }
+
+    function filterConfirmedOptions(memory, previousQuestion, questionType) {
+        const confirmed = memory && Array.isArray(memory.confirmedCorrectOptions)
+            ? memory.confirmedCorrectOptions
+            : [];
+        const knownWrong = collectKnownWrongOptions(memory, previousQuestion, questionType);
+        return confirmed.filter((option) => !knownWrong.some((wrong) => isOptionMatching(wrong, option)));
+    }
+
+    function resolveConfirmedOptionIndexes(options, memory, questionType) {
+        if (!Array.isArray(options) || !memory) return [];
+        if (questionType === "multi_select" && memory.confirmedCompleteSet !== true) return [];
+        const confirmed = filterConfirmedOptions(memory, null, questionType);
+        const indexes = options.reduce((matches, option, index) => {
+            if (confirmed.some((answer) => isOptionMatching(option, answer))) matches.push(index);
+            return matches;
+        }, []);
+        if (questionType === "multi_select" && indexes.length !== confirmed.length) return [];
+        return questionType === "single_choice" || questionType === "mcq" ? indexes.slice(0, 1) : indexes;
     }
 
     async function sendFullFeedback({ text, send }) {
         if (!text || !String(text).trim()) throw new Error("Feedback page is empty.");
+        const fullText = String(text);
+        const chunkSize = 4000;
+        const maxChunks = 4;
+        const chunkCount = Math.ceil(fullText.length / chunkSize);
+        if (chunkCount > maxChunks) {
+            throw new Error(`Feedback dài ${fullText.length} ký tự; đã lưu đầy đủ nhưng vượt giới hạn gửi an toàn ${maxChunks} phần.`);
+        }
         const parts = [];
-        for (let offset = 0; offset < text.length; offset += 4000) parts.push(text.slice(offset, offset + 4000));
+        for (let offset = 0; offset < fullText.length; offset += chunkSize) {
+            parts.push(fullText.slice(offset, offset + chunkSize));
+        }
         const notes = [];
         for (let index = 0; index < parts.length; index++) {
             notes.push(await send(parts[index], index, parts.length));
@@ -1383,17 +1451,25 @@
     }
 
     function resolveAssignmentTransition({ readyState, text = "", elapsedMs = 0, stableForMs = 0 } = {}) {
-        if (elapsedMs >= 8000 && readyState === "complete" && String(text).trim() && stableForMs >= 3000) return "ready";
+        if (elapsedMs >= 8000 && readyState === "complete" && hasUsableQuizPageText(text) && stableForMs >= 3000) return "ready";
         return elapsedMs >= 45000 ? "timeout" : "wait";
     }
 
     function resolveQuizPageLoadState({ readyState, text = "", elapsedMs = 0, timeoutMs = 30000 } = {}) {
-        if (readyState !== "loading" && String(text).trim()) return "ready";
+        if (readyState === "complete" && hasUsableQuizPageText(text)) return "ready";
         return elapsedMs >= timeoutMs ? "timeout" : "wait";
+    }
+
+    function hasUsableQuizPageText(text) {
+        const value = String(text || "").replace(/\s+/g, " ").trim();
+        return value.length >= 40 || /ready to start.*(?:activity|quiz|assignment)|\b(?:start|resume)\s+(?:assignment|quiz)\b|\byour grade\b/i.test(value);
     }
 
     const api = {
         classifyOptionFeedback,
+        collectKnownWrongOptions,
+        filterConfirmedOptions,
+        resolveConfirmedOptionIndexes,
         sendFullFeedback,
         resolveAssignmentTransition,
         copyRenderedQuestionText,
@@ -1441,6 +1517,7 @@
         mergeQuestionMemory,
         normalizeOptionText,
         normalizeQuestionKey,
+        normalizeQuizRetryCount,
         normalizeQuizResultSettleSeconds,
         normalizePath,
         normalizeVisionDecision,
